@@ -1,0 +1,36 @@
+# Coverage Path Planning Configuration
+
+connection:
+  # MAVLink connection string
+  # Serial: /dev/ttyUSB0 (baud rate applies)
+  # UDP:    udp:127.0.0.1:14550
+  # TCP:    tcp:127.0.0.1:5760
+  string: "udp:127.0.0.1:14500"
+  baud: 57600
+  source_system: 255
+  timeout: 30               # seconds to wait for heartbeat
+
+flight:
+  altitude: 20.0            # metres AGL for survey passes
+  speed: 5.0                # m/s groundspeed during coverage
+  takeoff_altitude: 10.0    # metres AGL to climb before starting
+  rtl_altitude: 30.0        # metres AGL for RTL
+
+coverage:
+  # Survey area: a circle centred on the launch position with the given radius.
+  # The centre is always read from the vehicle's GPS at arm time.
+  radius: 80.0                       # metres
+
+  pattern: "boustrophedon"  # boustrophedon | spiral
+  spacing: 10.0             # metres between parallel scan lines
+  angle: 0.0                # degrees – rotation of scan lines (0 = N-S)
+  entry: "nearest"          # nearest | first – which end of first line to start
+
+waypoint:
+  acceptance_radius: 2.0    # metres – considered "reached" (NED 2-D distance)
+  loiter_time: 0            # seconds to loiter at each waypoint (0 = pass-through)
+  timeout: 120              # seconds to wait for each waypoint before aborting
+
+logging:
+  level: "INFO"             # DEBUG | INFO | WARNING | ERROR
+  file: "coverage_flight.log"
