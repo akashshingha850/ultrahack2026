@@ -112,23 +112,29 @@ def boustrophedon(boundary: list[list[float]],
 def spiral(boundary: list[list[float]],
            spacing_m: float,
            angle_deg: float = 0.0) -> list[list[float]]:
-    """Inward rectangular spiral over a NED-metre polygon."""
+    """Outward hexagonal spiral from centre to fence boundary.
+
+    Each ring is a regular hexagon; vertices are the only waypoints so the
+    drone flies straight lines and the total count stays tiny (~6 per ring).
+    The outermost ring is kept strictly inside the fence radius.
+    """
     cx = sum(p[0] for p in boundary) / len(boundary)
     cy = sum(p[1] for p in boundary) / len(boundary)
-    rotated = _rotate(boundary, -angle_deg, cx, cy)
-    xmin, xmax, ymin, ymax = _bounds(rotated)
+    radius = max(math.hypot(p[0] - cx, p[1] - cy) for p in boundary)
 
+    offset = math.radians(angle_deg)
     waypoints: list[list[float]] = []
-    margin = 0.0
+    ring = 1
     while True:
-        x0, x1 = xmin + margin, xmax - margin
-        y0, y1 = ymin + margin, ymax - margin
-        if x0 >= x1 or y0 >= y1:
+        r = ring * spacing_m
+        if r >= radius:          # stay inside fence with at least one spacing margin
             break
-        waypoints += [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
-        margin += spacing_m
+        for i in range(6):
+            a = offset + math.radians(60 * i)
+            waypoints.append([cx + r * math.cos(a), cy + r * math.sin(a)])
+        ring += 1
 
-    return _rotate(waypoints, angle_deg, cx, cy)
+    return waypoints
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +144,11 @@ def spiral(boundary: list[list[float]],
 def fly_coverage(vehicle, waypoints: list[list[float]],
                  altitude_m: float, speed: float,
                  acceptance_radius: float, loiter_time: int,
-                 wp_timeout: int) -> None:
+                 wp_timeout: int,
+                 gimbal_pitch_deg: float | None = None) -> None:
     log = logging.getLogger("explore")
+    if gimbal_pitch_deg is not None:
+        mav.set_gimbal_pitch(vehicle, gimbal_pitch_deg)
     # down is negative in NED (positive = into ground)
     down = -altitude_m
     for i, (north, east) in enumerate(waypoints):
@@ -163,6 +172,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the NED waypoint list without connecting")
+    p.add_argument("--radius", type=float, default=None,
+                   help="Survey radius in metres (dry-run only; live flights use FENCE_RADIUS)")
     return p.parse_args()
 
 
@@ -177,11 +188,10 @@ def setup_logging(level: str, log_file: str) -> None:
     )
 
 
-def run(cfg: dict, dry_run: bool = False) -> None:
+def run(cfg: dict, dry_run: bool = False, cli_radius: float | None = None) -> None:
     log = logging.getLogger("explore")
 
     cov     = cfg["coverage"]
-    spacing = float(cov["spacing"])
     angle   = float(cov.get("angle", 0.0))
     pattern = cov.get("pattern", "boustrophedon")
     entry   = cov.get("entry", "nearest")
@@ -196,6 +206,22 @@ def run(cfg: dict, dry_run: bool = False) -> None:
     loiter_time     = int(wp_cfg.get("loiter_time", 0))
     wp_timeout      = int(wp_cfg.get("timeout", 120))
 
+    # --- Camera config: FOV-based spacing + gimbal angle ---
+    cam = cfg.get("camera", {})
+    if cam:
+        hfov = math.radians(float(cam["hfov_deg"]))
+        vfov = math.radians(float(cam.get("vfov_deg", cam["hfov_deg"])))
+        overlap = float(cam.get("overlap", 0.1))
+        swath_w = 2.0 * altitude * math.tan(hfov / 2.0)
+        swath_h = 2.0 * altitude * math.tan(vfov / 2.0)
+        spacing = min(swath_w, swath_h) * (1.0 - overlap)
+        gimbal_pitch = float(cam.get("gimbal_pitch_deg", -45.0))
+        log.info("Camera swath %.1f × %.1f m  overlap %.0f %%  → spacing %.1f m  gimbal %.1f°",
+                 swath_w, swath_h, overlap * 100, spacing, gimbal_pitch)
+    else:
+        spacing = float(cov["spacing"])
+        gimbal_pitch = None
+
     vehicle = None
     if not dry_run:
         # --- Connect first so we can read FENCE_RADIUS ---
@@ -207,17 +233,26 @@ def run(cfg: dict, dry_run: bool = False) -> None:
             timeout=int(conn.get("timeout", 30)),
         )
 
-    # --- Determine survey radius from vehicle fence, falling back to config ---
+    # --- Determine survey radius and apply ArduPilot fence margin ---
     if vehicle is not None:
         fence_r = mav.get_param(vehicle, "FENCE_RADIUS")
-        if fence_r is not None and fence_r > 0:
-            radius = fence_r
-            log.info("Using FENCE_RADIUS from vehicle: %.1f m", radius)
-        else:
-            radius = float(cov["radius"])
-            log.warning("FENCE_RADIUS not available; falling back to config radius %.1f m", radius)
+        if fence_r is None or fence_r <= 0:
+            raise RuntimeError("FENCE_RADIUS not set on vehicle – configure it before flying")
+        fence_margin = mav.get_param(vehicle, "FENCE_MARGIN") or 2.0
+        log.info("FENCE_RADIUS %.1f m  FENCE_MARGIN %.1f m", fence_r, fence_margin)
     else:
-        radius = float(cov["radius"])
+        if cli_radius is None:
+            raise RuntimeError("--radius required for dry-run (no vehicle to read FENCE_RADIUS)")
+        fence_r = cli_radius
+        fence_margin = 2.0   # ArduPilot default, no vehicle to query
+
+    radius = fence_r - fence_margin
+    if radius <= spacing:
+        raise RuntimeError(
+            f"Effective radius {radius:.1f} m (fence {fence_r:.1f} m − margin {fence_margin:.1f} m) "
+            f"is too small for spacing {spacing:.1f} m"
+        )
+    log.info("Effective survey radius: %.1f m", radius)
 
     # --- Generate path in NED metres ---
     boundary = circle_polygon_ned(radius)
@@ -269,7 +304,7 @@ def main() -> None:
         cfg.get("logging", {}).get("file", ""),
     )
     try:
-        run(cfg, dry_run=args.dry_run)
+        run(cfg, dry_run=args.dry_run, cli_radius=args.radius)
     except Exception as exc:
         logging.getLogger("explore").error("Fatal: %s", exc, exc_info=True)
         sys.exit(1)

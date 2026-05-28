@@ -66,11 +66,12 @@ def get_mode(vehicle: mavutil.mavfile) -> str:
 # ---------------------------------------------------------------------------
 
 def arm(vehicle: mavutil.mavfile, timeout: int = 10) -> None:
-    log.info("Arming …")
+    log.info("Arming (force) …")
+    # param2 = 21196 is ArduPilot's magic value to bypass pre-arm checks.
     vehicle.mav.command_long_send(
         vehicle.target_system, vehicle.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0, 1, 0, 0, 0, 0, 0, 0,
+        0, 1, 21196, 0, 0, 0, 0, 0,
     )
     _wait_ack(vehicle, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout)
     log.info("Armed")
@@ -191,6 +192,25 @@ def get_param(vehicle: mavutil.mavfile, param_name: str, timeout: int = 5) -> fl
         if msg and msg.param_id.rstrip("\x00") == param_name:
             return float(msg.param_value)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Gimbal
+# ---------------------------------------------------------------------------
+
+def set_gimbal_pitch(vehicle: mavutil.mavfile, pitch_deg: float) -> None:
+    """Set gimbal pitch. 0° = horizontal look-ahead, -90° = nadir (straight down)."""
+    vehicle.mav.command_long_send(
+        vehicle.target_system, vehicle.target_component,
+        mavutil.mavlink.MAV_CMD_DO_MOUNT_CONTROL,
+        0,
+        pitch_deg,   # param1: pitch  (-90 up to +90)
+        0.0,         # param2: roll
+        0.0,         # param3: yaw  (0 = forward relative to drone)
+        0, 0, 0,
+        mavutil.mavlink.MAV_MOUNT_MODE_MAVLINK_TARGETING,
+    )
+    log.info("Gimbal pitch → %.1f°  (%.1f° from nadir)", pitch_deg, pitch_deg + 90)
 
 
 # ---------------------------------------------------------------------------

@@ -11,20 +11,27 @@ connection:
   timeout: 30               # seconds to wait for heartbeat
 
 flight:
-  altitude: 20.0            # metres AGL for survey passes
+  altitude: 15.0            # metres AGL for survey passes
   speed: 5.0                # m/s groundspeed during coverage
-  takeoff_altitude: 10.0    # metres AGL to climb before starting
-  rtl_altitude: 30.0        # metres AGL for RTL
+  takeoff_altitude: 5.0    # metres AGL to climb before starting
+  rtl_altitude: 5.0        # metres AGL for RTL
 
 coverage:
-  # Survey area: a circle centred on the launch position with the given radius.
-  # The centre is always read from the vehicle's GPS at arm time.
-  radius: 80.0                       # metres
+  # Radius = FENCE_RADIUS − FENCE_MARGIN (both read from the vehicle).
+  # Pass --radius <m> on the CLI for dry-run testing.
 
-  pattern: "boustrophedon"  # boustrophedon | spiral
-  spacing: 10.0             # metres between parallel scan lines
-  angle: 0.0                # degrees – rotation of scan lines (0 = N-S)
-  entry: "nearest"          # nearest | first – which end of first line to start
+  pattern: "spiral"   # boustrophedon | spiral
+  spacing: 10.0       # fallback spacing (m) – ignored when camera: block is set
+  angle: 0.0          # degrees – rotation of the pattern (0 = north-aligned)
+  entry: "nearest"    # boustrophedon only: nearest | first
+
+# Camera: SIYI A8 Mini at 1× zoom.
+# Ring spacing is auto-computed as  min(swath_w, swath_h) × (1 – overlap).
+camera:
+  hfov_deg: 82.6          # horizontal FOV at 1× zoom
+  vfov_deg: 52.3          # vertical FOV (4K 16:9, derived from HFOV)
+  overlap:   0.10         # 10 % side overlap – enough for surveillance
+  gimbal_pitch_deg: -45.0 # 0 = look ahead, -90 = nadir; -45 optimal for window detection
 
 waypoint:
   acceptance_radius: 2.0    # metres – considered "reached" (NED 2-D distance)
