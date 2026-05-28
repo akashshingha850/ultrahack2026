@@ -66,6 +66,14 @@ def get_mode(vehicle: mavutil.mavfile) -> str:
 # ---------------------------------------------------------------------------
 
 def arm(vehicle: mavutil.mavfile, timeout: int = 10) -> None:
+    if _is_armed(vehicle):
+        log.info("Already armed")
+        return
+
+    current_altitude = _current_relative_alt(vehicle)
+    if current_altitude is not None and current_altitude > 1.0:
+        log.info("Already airborne at %.1f m – skipping arm", current_altitude)
+        return
     log.info("Arming (force) …")
     # param2 = 21196 is ArduPilot's magic value to bypass pre-arm checks.
     vehicle.mav.command_long_send(
@@ -93,7 +101,34 @@ def disarm(vehicle: mavutil.mavfile, force: bool = False, timeout: int = 10) -> 
 # ---------------------------------------------------------------------------
 
 def takeoff(vehicle: mavutil.mavfile, altitude: float, timeout: int = 30) -> None:
-    """GUIDED-mode takeoff to *altitude* metres AGL."""
+    """GUIDED-mode takeoff to *altitude* metres AGL.
+
+    If the drone is already airborne (relative_alt > 0.5 m) – e.g. from a
+    previous RTL that hasn't landed yet – NAV_TAKEOFF is skipped and a
+    SET_POSITION_TARGET_LOCAL_NED climb is used instead, which ArduPilot
+    accepts in flight.
+    """
+    current_altitude = _current_relative_alt(vehicle)
+
+    if current_altitude is not None and current_altitude >= altitude - 1.0:
+        log.info("Already at %.1f m – skipping takeoff", current_altitude)
+        return
+
+    # Drone is airborne but below the target: climb via goto_ned, not NAV_TAKEOFF.
+    # ArduPilot rejects NAV_TAKEOFF (result=4) whenever the vehicle is not on the ground.
+    if current_altitude is not None and current_altitude > 0.5:
+        log.info("Already airborne at %.1f m – climbing to %.1f m via position target",
+                 current_altitude, altitude)
+        pos = get_local_position(vehicle)
+        goto_ned(vehicle, pos["north"], pos["east"], -altitude)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = vehicle.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=1)
+            if msg and msg.relative_alt / 1000.0 >= altitude - 1.0:
+                log.info("Reached %.1f m", msg.relative_alt / 1000.0)
+                return
+        raise RuntimeError(f"Could not climb to {altitude} m within {timeout} s")
+
     log.info("Taking off to %.1f m …", altitude)
     vehicle.mav.command_long_send(
         vehicle.target_system, vehicle.target_component,
@@ -214,6 +249,32 @@ def set_gimbal_pitch(vehicle: mavutil.mavfile, pitch_deg: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Yaw
+# ---------------------------------------------------------------------------
+
+def set_yaw(vehicle: mavutil.mavfile, yaw_deg: float,
+            speed_deg_s: float = 20.0, relative: bool = False) -> None:
+    """
+    Command absolute (or relative) yaw.
+
+    yaw_deg     – target heading: 0 = North, 90 = East, clockwise positive.
+    speed_deg_s – angular slew rate (deg/s).
+    relative    – True to treat yaw_deg as an offset from current heading.
+    """
+    vehicle.mav.command_long_send(
+        vehicle.target_system, vehicle.target_component,
+        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+        0,
+        yaw_deg,
+        speed_deg_s,
+        1,                          # direction: 1 = CW
+        1 if relative else 0,       # 0 = absolute, 1 = relative
+        0, 0, 0,
+    )
+    log.debug("set_yaw → %.1f° (%s)", yaw_deg, "relative" if relative else "absolute")
+
+
+# ---------------------------------------------------------------------------
 # Speed
 # ---------------------------------------------------------------------------
 
@@ -268,3 +329,32 @@ def _wait_ack(vehicle: mavutil.mavfile, command: int, timeout: int = 10) -> None
                 raise RuntimeError(f"Command {command} rejected (result={ack.result})")
             return
     raise RuntimeError(f"No ACK for command {command} within {timeout} s")
+
+
+def _is_armed(vehicle: mavutil.mavfile) -> bool:
+    if hasattr(vehicle, "motors_armed"):
+        try:
+            return bool(vehicle.motors_armed())
+        except TypeError:
+            pass
+    msg = _latest_message(vehicle, "HEARTBEAT")
+    if msg is not None:
+        return bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+    msg = vehicle.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
+    return bool(msg and msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+
+
+def _current_relative_alt(vehicle: mavutil.mavfile) -> float | None:
+    msg = _latest_message(vehicle, "GLOBAL_POSITION_INT")
+    if msg is None:
+        msg = vehicle.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=1)
+    if msg is None:
+        return None
+    return msg.relative_alt / 1000.0
+
+
+def _latest_message(vehicle: mavutil.mavfile, message_type: str):
+    messages = getattr(vehicle, "messages", None)
+    if isinstance(messages, dict):
+        return messages.get(message_type)
+    return None
