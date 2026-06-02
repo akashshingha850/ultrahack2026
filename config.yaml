@@ -5,7 +5,7 @@ connection:
   # Serial: /dev/ttyUSB0 (baud rate applies)
   # UDP:    udp:127.0.0.1:14550
   # TCP:    tcp:127.0.0.1:5760
-  string: "udp:127.0.0.1:14500"
+  string: "udpin:0.0.0.0:14550"
   baud: 57600
   source_system: 255
   timeout: 30               # seconds to wait for heartbeat
@@ -53,6 +53,15 @@ nbv:
   # so the planner explores new viewpoints instead of spinning in place.
   revisit_decay:     0.1    # score multiplier for already-visited vicinity (0–1)
   revisit_radius_m:  5.0    # metres – radius considered "already visited"
+
+stream:
+  input:  "rtsp://192.168.192.200:8554/live"
+  output: "rtsp://0.0.0.0:8554/live"
+
+yolo:
+  model:      "yolo11n.pt"   # model weights file (downloaded automatically if missing)
+  conf:       0.35           # minimum confidence threshold
+  imgsz:      640            # inference input size (px)
 
 logging:
   level: "INFO"             # DEBUG | INFO | WARNING | ERROR

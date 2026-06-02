@@ -166,7 +166,7 @@ def goto_ned(vehicle: mavutil.mavfile,
     if speed is not None:
         set_speed(vehicle, speed)
 
-    TYPE_MASK_POS_ONLY = 0b0000111111111000  # ignore vel / accel / yaw
+    TYPE_MASK_POS_ONLY = 0b110111111000  # ignore vel / accel / yaw (bit 9 clear = no force)
     vehicle.mav.set_position_target_local_ned_send(
         0,                                          # time_boot_ms
         vehicle.target_system,
@@ -179,6 +179,46 @@ def goto_ned(vehicle: mavutil.mavfile,
         0, 0,                                       # yaw yaw_rate
     )
     log.debug("goto_ned → N=%.1f E=%.1f D=%.1f", north, east, down)
+
+
+def move_forward(vehicle: mavutil.mavfile, distance: float, speed: float | None = None) -> None:
+    """Move forward by *distance* metres relative to current heading."""
+    _move_body(vehicle, x=distance, y=0, speed=speed)
+
+def move_backward(vehicle: mavutil.mavfile, distance: float, speed: float | None = None) -> None:
+    """Move backward by *distance* metres relative to current heading."""
+    _move_body(vehicle, x=-distance, y=0, speed=speed)
+
+def move_right(vehicle: mavutil.mavfile, distance: float, speed: float | None = None) -> None:
+    """Move right by *distance* metres relative to current heading."""
+    _move_body(vehicle, x=0, y=distance, speed=speed)
+
+def move_left(vehicle: mavutil.mavfile, distance: float, speed: float | None = None) -> None:
+    """Move left by *distance* metres relative to current heading."""
+    _move_body(vehicle, x=0, y=-distance, speed=speed)
+
+def _move_body(vehicle: mavutil.mavfile, x: float, y: float, speed: float | None = None) -> None:
+    """Move relative to current heading by rotating (x=forward, y=right) into NED."""
+    if speed is not None:
+        set_speed(vehicle, speed)
+
+    # Get current heading so we can rotate body-frame offset into NED
+    att = vehicle.recv_match(type="ATTITUDE", blocking=True, timeout=5)
+    if att is None:
+        raise RuntimeError("No ATTITUDE message received")
+    yaw = att.yaw  # radians, 0 = North, clockwise positive
+
+    # Rotate body (forward=x, right=y) → NED
+    north_offset = x * math.cos(yaw) - y * math.sin(yaw)
+    east_offset  = x * math.sin(yaw) + y * math.cos(yaw)
+
+    pos = get_local_position(vehicle)
+    goto_ned(vehicle,
+             pos["north"] + north_offset,
+             pos["east"]  + east_offset,
+             pos["down"])
+    log.debug("move_body → x=%.1f y=%.1f (yaw=%.1f°, N+%.1f E+%.1f)",
+              x, y, math.degrees(yaw), north_offset, east_offset)
 
 
 def get_local_position(vehicle: mavutil.mavfile) -> dict:
@@ -274,6 +314,34 @@ def set_yaw(vehicle: mavutil.mavfile, yaw_deg: float,
     log.debug("set_yaw → %.1f° (%s)", yaw_deg, "relative" if relative else "absolute")
 
 
+def rotate_right(vehicle: mavutil.mavfile, angle_deg: float, speed_deg_s: float = 20.0) -> None:
+    """Rotate clockwise by *angle_deg* degrees relative to current heading."""
+    vehicle.mav.command_long_send(
+        vehicle.target_system, vehicle.target_component,
+        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+        0,
+        angle_deg, speed_deg_s,
+        1,   # CW
+        1,   # relative
+        0, 0, 0,
+    )
+    log.debug("rotate_right → %.1f°", angle_deg)
+
+
+def rotate_left(vehicle: mavutil.mavfile, angle_deg: float, speed_deg_s: float = 20.0) -> None:
+    """Rotate counter-clockwise by *angle_deg* degrees relative to current heading."""
+    vehicle.mav.command_long_send(
+        vehicle.target_system, vehicle.target_component,
+        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+        0,
+        angle_deg, speed_deg_s,
+        -1,  # CCW
+        1,   # relative
+        0, 0, 0,
+    )
+    log.debug("rotate_left → %.1f°", angle_deg)
+
+
 # ---------------------------------------------------------------------------
 # Speed
 # ---------------------------------------------------------------------------
@@ -353,8 +421,15 @@ def _current_relative_alt(vehicle: mavutil.mavfile) -> float | None:
     return msg.relative_alt / 1000.0
 
 
+def close(vehicle: mavutil.mavfile) -> None:
+    """Close the MAVLink connection."""
+    vehicle.close()
+    log.info("Connection closed")
+
+
 def _latest_message(vehicle: mavutil.mavfile, message_type: str):
     messages = getattr(vehicle, "messages", None)
     if isinstance(messages, dict):
         return messages.get(message_type)
     return None
+

@@ -35,3 +35,7 @@ Thumbs.db
 *.bin
 *.param
 
+#YOLO
+*.pt
+*.engine
+*.onnx
