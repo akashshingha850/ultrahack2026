@@ -144,11 +144,8 @@ def spiral(boundary: list[list[float]],
 def fly_coverage(vehicle, waypoints: list[list[float]],
                  altitude_m: float, speed: float,
                  acceptance_radius: float, loiter_time: int,
-                 wp_timeout: int,
-                 gimbal_pitch_deg: float | None = None) -> None:
+                 wp_timeout: int) -> None:
     log = logging.getLogger("explore")
-    if gimbal_pitch_deg is not None:
-        mav.set_gimbal_pitch(vehicle, gimbal_pitch_deg)
     # down is negative in NED (positive = into ground)
     down = -altitude_m
     for i, (north, east) in enumerate(waypoints):
@@ -206,7 +203,7 @@ def run(cfg: dict, dry_run: bool = False, cli_radius: float | None = None) -> No
     loiter_time     = int(wp_cfg.get("loiter_time", 0))
     wp_timeout      = int(wp_cfg.get("timeout", 120))
 
-    # --- Camera config: FOV-based spacing + gimbal angle ---
+    # --- Camera config: FOV-based spacing ---
     cam = cfg.get("camera", {})
     if cam:
         hfov = math.radians(float(cam["hfov_deg"]))
@@ -215,12 +212,10 @@ def run(cfg: dict, dry_run: bool = False, cli_radius: float | None = None) -> No
         swath_w = 2.0 * altitude * math.tan(hfov / 2.0)
         swath_h = 2.0 * altitude * math.tan(vfov / 2.0)
         spacing = min(swath_w, swath_h) * (1.0 - overlap)
-        gimbal_pitch = float(cam.get("gimbal_pitch_deg", -45.0))
-        log.info("Camera swath %.1f × %.1f m  overlap %.0f %%  → spacing %.1f m  gimbal %.1f°",
-                 swath_w, swath_h, overlap * 100, spacing, gimbal_pitch)
+        log.info("Camera swath %.1f × %.1f m  overlap %.0f %%  → spacing %.1f m",
+                 swath_w, swath_h, overlap * 100, spacing)
     else:
         spacing = float(cov["spacing"])
-        gimbal_pitch = None
 
     vehicle = None
     if not dry_run:

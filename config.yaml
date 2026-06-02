@@ -11,7 +11,7 @@ connection:
   timeout: 30               # seconds to wait for heartbeat
 
 flight:
-  altitude: 15.0            # metres AGL for survey passes
+  altitude: 5.0            # metres AGL for survey passes
   speed: 5.0                # m/s groundspeed during coverage
   takeoff_altitude: 5.0    # metres AGL to climb before starting
   rtl_altitude: 5.0        # metres AGL for RTL
@@ -31,7 +31,6 @@ camera:
   hfov_deg: 82.6          # horizontal FOV at 1× zoom
   vfov_deg: 52.3          # vertical FOV (4K 16:9, derived from HFOV)
   overlap:   0.10         # 10 % side overlap – enough for surveillance
-  gimbal_pitch_deg: -45.0 # 0 = look ahead, -90 = nadir; -45 optimal for window detection
 
 waypoint:
   acceptance_radius: 2.0    # metres – considered "reached" (NED 2-D distance)
@@ -44,13 +43,10 @@ nbv:
   min_gain:          1.0    # stop when best information gain falls below this (cells)
   candidate_spacing: 5.0    # metres between candidate grid positions
   grid_resolution:   1.0    # metres per information-grid cell
-  n_headings:        8      # headings tested per candidate position (360°/n_headings apart)
   dist_penalty:      0.05   # penalise travel distance: score = gain / (1 + penalty * dist)
 
   # Quality constraints for building detection
   # Drone must physically fly within this range to count a cell as observed.
-  # At altitude 15 m + gimbal -45°, slant range to footprint centre ≈ 21 m;
-  # 25 m lets the drone see one full footprint ahead but not the far horizon.
   max_obs_range_m:   25.0
 
   # After visiting a position, heavily discount candidates within this radius

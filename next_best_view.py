@@ -3,11 +3,11 @@
 Next-Best-View (NBV) planner for ArduPilot / MAVProxy.
 
 The drone maintains a 2-D information grid over the survey area (NED metres,
-arming point = origin).  At each step it evaluates every (position, heading)
-candidate and flies to the one that maximises information gain – unseen grid
-cells in the projected camera footprint – optionally penalised by travel
-distance.  The loop stops when coverage reaches the configured target, gain
-falls below min_gain, or max_steps is exhausted.
+arming point = origin).  At each step it evaluates every candidate position
+and flies to the one that maximises information gain – unseen grid cells in
+the projected nadir camera footprint – optionally penalised by travel distance.
+The loop stops when coverage reaches the configured target, gain falls below
+min_gain, or max_steps is exhausted.
 
 Usage:
     python next_best_view.py [--config config.yaml] [--dry-run] [--radius <m>]
@@ -17,7 +17,6 @@ import argparse
 import logging
 import math
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,55 +85,24 @@ class InfoGrid:
 def footprint_cells(
     north: float,
     east: float,
-    heading_deg: float,
     altitude: float,
     hfov_deg: float,
     vfov_deg: float,
-    gimbal_pitch_deg: float,
     grid: InfoGrid,
     max_range_m: float | None = None,
 ) -> list[tuple[int, int]]:
     """
-    Project the camera FOV onto the ground plane and return overlapping grid cells.
+    Project the nadir (straight-down) camera FOV onto the ground and return overlapping grid cells.
 
-    heading_deg      – drone yaw: 0 = North, 90 = East, clockwise positive.
-    gimbal_pitch_deg – 0 = horizontal look-ahead, -90 = nadir (straight down).
-    max_range_m      – if set, discard cells further than this from the viewpoint.
-                       Enforces a minimum observation resolution: the drone must
-                       physically fly close enough to each unseen area.
+    max_range_m – if set, discard cells further than this from the viewpoint.
     """
-    # angle_from_nadir: 0° = looking straight down, 90° = looking horizontal
-    pitch_nadir = math.radians(90.0 + gimbal_pitch_deg)
-    hfov_r = math.radians(hfov_deg)
-    vfov_r = math.radians(vfov_deg)
-
-    # Near / far ground distances along the heading direction
-    near_a = max(0.0, pitch_nadir - vfov_r / 2.0)
-    far_a = min(math.radians(89.9), pitch_nadir + vfov_r / 2.0)
-
-    near_fwd = altitude * math.tan(near_a)
-    far_fwd = altitude * math.tan(far_a)
-
-    # Lateral half-widths at the near and far edges
-    near_hw = (altitude / math.cos(near_a)) * math.tan(hfov_r / 2.0)
-    far_hw = (altitude / math.cos(far_a)) * math.tan(hfov_r / 2.0)
-
-    # 4 trapezoid corners in body frame (forward-m, right-m)
-    body = [
-        (near_fwd, -near_hw),   # near-left
-        (near_fwd,  near_hw),   # near-right
-        (far_fwd,   far_hw),    # far-right
-        (far_fwd,  -far_hw),    # far-left
-    ]
-
-    # Rotate body frame to NED
-    # forward_NED = (cos hdg, sin hdg); right_NED = (-sin hdg, cos hdg)
-    hdg = math.radians(heading_deg)
-    cos_h, sin_h = math.cos(hdg), math.sin(hdg)
+    hw = altitude * math.tan(math.radians(hfov_deg / 2.0))
+    hh = altitude * math.tan(math.radians(vfov_deg / 2.0))
     ned_poly = [
-        (north + f * cos_h - r * sin_h,
-         east  + f * sin_h + r * cos_h)
-        for f, r in body
+        (north - hh, east - hw),
+        (north - hh, east + hw),
+        (north + hh, east + hw),
+        (north + hh, east - hw),
     ]
 
     cells = _rasterize(ned_poly, grid)
@@ -198,19 +166,11 @@ def _in_polygon(n: float, e: float, poly: list[tuple[float, float]]) -> bool:
 class Candidate:
     north: float
     east: float
-    heading_deg: float
     score: float = 0.0
 
 
-def generate_candidates(
-    radius: float, spacing: float, n_headings: int = 8
-) -> list[Candidate]:
-    """
-    Build a uniform grid of (position, heading) candidates inside the survey circle.
-
-    spacing    – grid step between candidate positions (metres).
-    n_headings – number of evenly-spaced headings tested per position.
-    """
+def generate_candidates(radius: float, spacing: float) -> list[Candidate]:
+    """Build a uniform grid of position candidates inside the survey circle."""
     r2 = radius ** 2
     candidates: list[Candidate] = []
     n = -radius + spacing / 2.0
@@ -218,8 +178,7 @@ def generate_candidates(
         e = -radius + spacing / 2.0
         while e <= radius:
             if n ** 2 + e ** 2 <= r2:
-                for k in range(n_headings):
-                    candidates.append(Candidate(n, e, 360.0 * k / n_headings))
+                candidates.append(Candidate(n, e))
             e += spacing
         n += spacing
     return candidates
@@ -231,7 +190,6 @@ def score_candidates(
     altitude: float,
     hfov_deg: float,
     vfov_deg: float,
-    gimbal_pitch_deg: float,
     cur_north: float,
     cur_east: float,
     dist_penalty: float,
@@ -254,8 +212,8 @@ def score_candidates(
     """
     for c in candidates:
         cells = footprint_cells(
-            c.north, c.east, c.heading_deg,
-            altitude, hfov_deg, vfov_deg, gimbal_pitch_deg, grid,
+            c.north, c.east,
+            altitude, hfov_deg, vfov_deg, grid,
             max_range_m=max_obs_range_m,
         )
         gain = grid.unseen_count(cells)
@@ -285,7 +243,6 @@ def nbv_loop(vehicle, cfg: dict) -> None:
     cam = cfg.get("camera", {})
     hfov_deg = float(cam.get("hfov_deg", 82.6))
     vfov_deg = float(cam.get("vfov_deg", 52.3))
-    gimbal_pitch_deg = float(cam.get("gimbal_pitch_deg", -45.0))
 
     wp = cfg.get("waypoint", {})
     acceptance_r = float(wp.get("acceptance_radius", 2.0))
@@ -297,7 +254,6 @@ def nbv_loop(vehicle, cfg: dict) -> None:
     min_gain          = float(nbv_cfg.get("min_gain",          1.0))
     candidate_spacing = float(nbv_cfg.get("candidate_spacing", 5.0))
     grid_resolution   = float(nbv_cfg.get("grid_resolution",   1.0))
-    n_headings        = int(nbv_cfg.get("n_headings",          8))
     dist_penalty      = float(nbv_cfg.get("dist_penalty",      0.05))
     max_obs_range_m   = nbv_cfg.get("max_obs_range_m", None)
     if max_obs_range_m is not None:
@@ -315,7 +271,6 @@ def nbv_loop(vehicle, cfg: dict) -> None:
              radius, fence_r, fence_margin)
 
     grid = InfoGrid(radius, resolution_m=grid_resolution)
-    mav.set_gimbal_pitch(vehicle, gimbal_pitch_deg)
 
     # Arm and climb to survey altitude
     mav.set_mode(vehicle, "GUIDED")
@@ -331,10 +286,10 @@ def nbv_loop(vehicle, cfg: dict) -> None:
             pos = mav.get_local_position(vehicle)
             cur_n, cur_e = pos["north"], pos["east"]
 
-            candidates = generate_candidates(radius, candidate_spacing, n_headings)
+            candidates = generate_candidates(radius, candidate_spacing)
             score_candidates(
                 candidates, grid, altitude,
-                hfov_deg, vfov_deg, gimbal_pitch_deg,
+                hfov_deg, vfov_deg,
                 cur_n, cur_e, dist_penalty,
                 max_obs_range_m=max_obs_range_m,
                 visited=visited,
@@ -344,9 +299,9 @@ def nbv_loop(vehicle, cfg: dict) -> None:
 
             best = max(candidates, key=lambda c: c.score)
             log.info(
-                "Step %d/%d  gain=%.1f  N=%.1f E=%.1f hdg=%.0f°  coverage=%.1f%%",
+                "Step %d/%d  gain=%.1f  N=%.1f E=%.1f  coverage=%.1f%%",
                 step, max_steps, best.score,
-                best.north, best.east, best.heading_deg,
+                best.north, best.east,
                 grid.coverage() * 100,
             )
 
@@ -359,16 +314,12 @@ def nbv_loop(vehicle, cfg: dict) -> None:
             mav.wait_ned_reached(vehicle, best.north, best.east,
                                  radius=acceptance_r, timeout=wp_timeout)
 
-            # Rotate to the best observation heading and let gimbal settle
-            mav.set_yaw(vehicle, best.heading_deg)
-            time.sleep(1.5)
-
             # Record what was actually observed at the reached pose
             reached = mav.get_local_position(vehicle)
             visited.append((reached["north"], reached["east"]))
             cells = footprint_cells(
-                reached["north"], reached["east"], best.heading_deg,
-                altitude, hfov_deg, vfov_deg, gimbal_pitch_deg, grid,
+                reached["north"], reached["east"],
+                altitude, hfov_deg, vfov_deg, grid,
                 max_range_m=max_obs_range_m,
             )
             grid.mark(cells)
@@ -396,7 +347,6 @@ def dry_run(cfg: dict, cli_radius: float) -> None:
     nbv_cfg = cfg.get("nbv", {})
     candidate_spacing = float(nbv_cfg.get("candidate_spacing", 5.0))
     grid_resolution   = float(nbv_cfg.get("grid_resolution",   1.0))
-    n_headings        = int(nbv_cfg.get("n_headings",          8))
     dist_penalty      = float(nbv_cfg.get("dist_penalty",      0.05))
     max_steps         = int(nbv_cfg.get("max_steps",           100))
     coverage_target   = float(nbv_cfg.get("coverage_target",   0.90))
@@ -409,9 +359,8 @@ def dry_run(cfg: dict, cli_radius: float) -> None:
 
     altitude = float(cfg["flight"]["altitude"])
     cam = cfg.get("camera", {})
-    hfov_deg         = float(cam.get("hfov_deg",         82.6))
-    vfov_deg         = float(cam.get("vfov_deg",         52.3))
-    gimbal_pitch_deg = float(cam.get("gimbal_pitch_deg", -45.0))
+    hfov_deg = float(cam.get("hfov_deg", 82.6))
+    vfov_deg = float(cam.get("vfov_deg", 52.3))
 
     radius = cli_radius - 2.0          # apply default fence margin
     grid = InfoGrid(radius, resolution_m=grid_resolution)
@@ -421,14 +370,13 @@ def dry_run(cfg: dict, cli_radius: float) -> None:
     print(f"\n=== DRY RUN – NBV planner  radius={radius:.1f} m  "
           f"resolution={grid_resolution:.1f} m  "
           f"max_obs_range={max_obs_range_m} m ===")
-    print(f"  {'step':>4}  {'north_m':>9}  {'east_m':>9}  "
-          f"{'hdg°':>6}  {'gain':>6}  {'cov%':>6}")
+    print(f"  {'step':>4}  {'north_m':>9}  {'east_m':>9}  {'gain':>6}  {'cov%':>6}")
 
     for step in range(1, max_steps + 1):
-        candidates = generate_candidates(radius, candidate_spacing, n_headings)
+        candidates = generate_candidates(radius, candidate_spacing)
         score_candidates(
             candidates, grid, altitude,
-            hfov_deg, vfov_deg, gimbal_pitch_deg,
+            hfov_deg, vfov_deg,
             cur_n, cur_e, dist_penalty,
             max_obs_range_m=max_obs_range_m,
             visited=visited,
@@ -443,15 +391,15 @@ def dry_run(cfg: dict, cli_radius: float) -> None:
             break
 
         cells = footprint_cells(
-            best.north, best.east, best.heading_deg,
-            altitude, hfov_deg, vfov_deg, gimbal_pitch_deg, grid,
+            best.north, best.east,
+            altitude, hfov_deg, vfov_deg, grid,
             max_range_m=max_obs_range_m,
         )
         grid.mark(cells)
         cov = grid.coverage()
 
         print(f"  {step:4d}  {best.north:9.2f}  {best.east:9.2f}  "
-              f"{best.heading_deg:6.0f}  {best.score:6.0f}  {cov*100:6.1f}")
+              f"{best.score:6.0f}  {cov*100:6.1f}")
 
         visited.append((best.north, best.east))
         cur_n, cur_e = best.north, best.east
