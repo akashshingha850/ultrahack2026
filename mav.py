@@ -171,10 +171,11 @@ def goto_ned(vehicle: mavutil.mavfile,
 
     if yaw_rad is not None:
         # use position + yaw; ignore vel / accel / yaw_rate (bit 9 cleared)
-        type_mask = 0b0000101111111000
+        type_mask = 0b0000_1011_1111_1000
     else:
         # use position only; ignore vel / accel / yaw / yaw_rate
-        type_mask = 0b0000111111111000
+        type_mask = 0b0000_1111_1111_1000
+
     vehicle.mav.set_position_target_local_ned_send(
         0,
         vehicle.target_system,
@@ -475,15 +476,15 @@ def _current_relative_alt(vehicle: mavutil.mavfile) -> float | None:
     return msg.relative_alt / 1000.0
 
 
+<<<<<<< HEAD
 def close(vehicle: mavutil.mavfile) -> None:
     """Close the MAVLink connection."""
     vehicle.close()
     log.info("Connection closed")
-
-
+=======
 def _move_body_velocity(vehicle: mavutil.mavfile, vx: float, vy: float) -> None:
     """Send a body-frame velocity setpoint. vx=forward, vy=right (m/s)."""
-    TYPE_MASK_VEL_ONLY = 0b0000011111000111
+    TYPE_MASK_VEL_ONLY = 0b0000_0111_1100_0111
     vehicle.mav.set_position_target_local_ned_send(
         0,
         vehicle.target_system,
@@ -521,6 +522,7 @@ def _current_yaw_rad(vehicle: mavutil.mavfile) -> float:
     if msg is None:
         raise RuntimeError("No ATTITUDE message received")
     return msg.yaw
+>>>>>>> 6f20fc3 (Refactor main.py to load configuration from YAML and establish MAVLink connection; add movement functions in mav.py for directional flight control.)
 
 
 def _latest_message(vehicle: mavutil.mavfile, message_type: str):
