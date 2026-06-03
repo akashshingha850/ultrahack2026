@@ -8,6 +8,7 @@ yolo_cfg   = cfg["yolo"]
 stream_cfg = cfg["stream"]
 
 model = YOLO(yolo_cfg["model"])
+# model.export(format="engine", half=True, dynamic=True)  # export to TensorRT engine for faster inference on Jetson Nano   
 
 for result in model(stream_cfg["input"], stream=True, conf=yolo_cfg["conf"],
                     imgsz=yolo_cfg["imgsz"], show=True, verbose=False):

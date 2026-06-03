@@ -59,7 +59,7 @@ stream:
   output: "rtsp://0.0.0.0:8554/live"
 
 yolo:
-  model:      "yolo11n.pt"   # model weights file (downloaded automatically if missing)
+  model:      "yolo26s.pt"   # model weights file (downloaded automatically if missing)
   conf:       0.35           # minimum confidence threshold
   imgsz:      640            # inference input size (px)
 
