@@ -5,7 +5,7 @@ connection:
   # Serial: /dev/ttyUSB0 (baud rate applies)
   # UDP:    udp:127.0.0.1:14550
   # TCP:    tcp:127.0.0.1:5760
-  string: "udpin:0.0.0.0:14550"
+  string: "udpin:0.0.0.0:14500"
   baud: 57600
   source_system: 255
   timeout: 30               # seconds to wait for heartbeat

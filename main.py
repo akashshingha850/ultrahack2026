@@ -1,7 +1,7 @@
 import yaml
 import siyi
 import mav
-<<<<<<< HEAD
+
 import time
 
 with open("config.yaml") as f:
@@ -15,21 +15,10 @@ vehicle = mav.connect(
     timeout=conn_cfg.get("timeout", 30),
 )
 
-# Check and set mode to GUIDED
-mode = mav.get_mode(vehicle)
-print(f"Current mode: {mode}")
-
-if mode != "GUIDED":
-    mav.set_mode(vehicle, "GUIDED")
-
-#get postion
-position = mav.get_local_position(vehicle)
-
-mav.move_backward(vehicle, 5.0)  # move backward 5 metres
-time.sleep(10)  # wait for the movement to complete
-
-position_new = mav.get_local_position(vehicle)
-print(f"Moved from {position} to {position_new}")
+mav.move_forward_distance(vehicle, 10.0)  # move forward 10 metres
+mav.move_right_distance(vehicle, 8.0)     # move right 8 metres
+mav.move_backward_distance(vehicle, 6.0)  # move backward 6 metres
+mav.move_left_distance(vehicle, 4.0)    # move left 4 metres
 
 #close connection
 mav.close(vehicle)
