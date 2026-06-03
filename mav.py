@@ -156,29 +156,39 @@ def rtl(vehicle: mavutil.mavfile) -> None:
 
 def goto_ned(vehicle: mavutil.mavfile,
              north: float, east: float, down: float,
-             speed: float | None = None) -> None:
+             speed: float | None = None,
+             yaw_rad: float | None = None) -> None:
     """
     Fly to a position in MAV_FRAME_LOCAL_NED.
 
     north / east / down are metres from the EKF origin (= arming point).
     down is negative for altitude above home (e.g. 20 m AGL → down=-20).
+    yaw_rad: if provided, hold this heading during the move (prevents ArduPilot
+             from yawing to face the target).
     """
     if speed is not None:
         set_speed(vehicle, speed)
 
-    TYPE_MASK_POS_ONLY = 0b110111111000  # ignore vel / accel / yaw (bit 9 clear = no force)
+    if yaw_rad is not None:
+        # use position + yaw; ignore vel / accel / yaw_rate (bit 9 cleared)
+        type_mask = 0b0000101111111000
+    else:
+        # use position only; ignore vel / accel / yaw / yaw_rate
+        type_mask = 0b0000111111111000
     vehicle.mav.set_position_target_local_ned_send(
-        0,                                          # time_boot_ms
+        0,
         vehicle.target_system,
         vehicle.target_component,
         mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-        TYPE_MASK_POS_ONLY,
+        type_mask,
         north, east, down,
-        0, 0, 0,                                    # vx vy vz
-        0, 0, 0,                                    # afx afy afz
-        0, 0,                                       # yaw yaw_rate
+        0, 0, 0,
+        0, 0, 0,
+        yaw_rad if yaw_rad is not None else 0, 0,
     )
-    log.debug("goto_ned → N=%.1f E=%.1f D=%.1f", north, east, down)
+    log.debug("goto_ned → N=%.1f E=%.1f D=%.1f yaw=%s",
+              north, east, down,
+              f"{math.degrees(yaw_rad):.1f}°" if yaw_rad is not None else "free")
 
 
 def move_forward(vehicle: mavutil.mavfile, distance: float, speed: float | None = None) -> None:
@@ -355,6 +365,50 @@ def set_speed(vehicle: mavutil.mavfile, speed: float, speed_type: int = 1) -> No
     )
 
 
+def move_forward_speed(vehicle: mavutil.mavfile, speed: float) -> None:
+    """Continuous forward flight at *speed* m/s (body frame). Send 0 to stop."""
+    _move_body_velocity(vehicle, speed, 0)
+
+
+def move_backward_speed(vehicle: mavutil.mavfile, speed: float) -> None:
+    """Continuous backward flight at *speed* m/s (body frame)."""
+    _move_body_velocity(vehicle, -speed, 0)
+
+
+def move_right_speed(vehicle: mavutil.mavfile, speed: float) -> None:
+    """Continuous rightward flight at *speed* m/s (body frame)."""
+    _move_body_velocity(vehicle, 0, speed)
+
+
+def move_left_speed(vehicle: mavutil.mavfile, speed: float) -> None:
+    """Continuous leftward flight at *speed* m/s (body frame)."""
+    _move_body_velocity(vehicle, 0, -speed)
+
+
+def move_forward_distance(vehicle: mavutil.mavfile, distance: float,
+                           timeout: int = 60) -> None:
+    """Fly *distance* metres forward along the current heading, then stop."""
+    _move_ned_distance(vehicle, distance, 0, timeout)
+
+
+def move_backward_distance(vehicle: mavutil.mavfile, distance: float,
+                            timeout: int = 60) -> None:
+    """Fly *distance* metres backward along the current heading, then stop."""
+    _move_ned_distance(vehicle, -distance, 0, timeout)
+
+
+def move_right_distance(vehicle: mavutil.mavfile, distance: float,
+                         timeout: int = 60) -> None:
+    """Fly *distance* metres to the right of the current heading, then stop."""
+    _move_ned_distance(vehicle, 0, distance, timeout)
+
+
+def move_left_distance(vehicle: mavutil.mavfile, distance: float,
+                        timeout: int = 60) -> None:
+    """Fly *distance* metres to the left of the current heading, then stop."""
+    _move_ned_distance(vehicle, 0, -distance, timeout)
+
+
 # ---------------------------------------------------------------------------
 # Telemetry
 # ---------------------------------------------------------------------------
@@ -425,6 +479,48 @@ def close(vehicle: mavutil.mavfile) -> None:
     """Close the MAVLink connection."""
     vehicle.close()
     log.info("Connection closed")
+
+
+def _move_body_velocity(vehicle: mavutil.mavfile, vx: float, vy: float) -> None:
+    """Send a body-frame velocity setpoint. vx=forward, vy=right (m/s)."""
+    TYPE_MASK_VEL_ONLY = 0b0000011111000111
+    vehicle.mav.set_position_target_local_ned_send(
+        0,
+        vehicle.target_system,
+        vehicle.target_component,
+        mavutil.mavlink.MAV_FRAME_BODY_NED,
+        TYPE_MASK_VEL_ONLY,
+        0, 0, 0,
+        vx, vy, 0,
+        0, 0, 0,
+        0, 0,
+    )
+    log.debug("body velocity → vx=%.2f vy=%.2f m/s", vx, vy)
+
+
+def _move_ned_distance(vehicle: mavutil.mavfile,
+                        fwd: float, right: float,
+                        timeout: int) -> None:
+    """Move *fwd* m forward and *right* m rightward (negative = backward/left)."""
+    pos = get_local_position(vehicle)
+    yaw = _current_yaw_rad(vehicle)
+    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+    target_north = pos["north"] + fwd * cos_y - right * sin_y
+    target_east  = pos["east"]  + fwd * sin_y + right * cos_y
+    # lock yaw on lateral moves so ArduPilot doesn't rotate to face the target
+    hold_yaw = yaw if right != 0 else None
+    goto_ned(vehicle, target_north, target_east, pos["down"], yaw_rad=hold_yaw)
+    wait_ned_reached(vehicle, target_north, target_east, timeout=timeout)
+    log.info("_move_ned_distance: fwd=%.1f right=%.1f complete", fwd, right)
+
+
+def _current_yaw_rad(vehicle: mavutil.mavfile) -> float:
+    msg = _latest_message(vehicle, "ATTITUDE")
+    if msg is None:
+        msg = vehicle.recv_match(type="ATTITUDE", blocking=True, timeout=3)
+    if msg is None:
+        raise RuntimeError("No ATTITUDE message received")
+    return msg.yaw
 
 
 def _latest_message(vehicle: mavutil.mavfile, message_type: str):
