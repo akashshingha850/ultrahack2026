@@ -103,15 +103,23 @@ FC SERIAL4 GND →  LiDAR GND
 > The C1 motor power and logic are both 5V. Ensure the FC's spare UART port can source enough current, or power the LiDAR from a dedicated 5V BEC.
 
 ### ArduPilot Parameters
-| Parameter        | Value | Notes                         |
-|------------------|-------|-------------------------------|
-| SERIAL4_PROTOCOL | 11    | Lidar360                      |
-| SERIAL4_BAUD     | 115   | 115200                        |
-| PRX1_TYPE        | 5     | RPLidar                       |
-| PRX1_MIN_CM      | 20    | Min range 0.2 m               |
-| PRX1_MAX_CM      | 1200  | Max range 12 m (C1 spec)      |
-| PRX1_ORIENT      | 0     | Adjust if LiDAR is rotated    |
-| AVOID_ENABLE     | 3     | Proximity + fence avoidance   |
+| Parameter        | Value | Notes                                        |
+|------------------|-------|----------------------------------------------|
+| SERIAL4_PROTOCOL | 11    | Lidar360                                     |
+| SERIAL4_BAUD     | 460   | 460800 baud (C1 requirement)                 |
+| BRD_SER4_RTSCTS  | 0     | Disable flow control (not wired on aux UART) |
+| PRX1_TYPE        | 5     | RPLidar                                      |
+| PRX1_MIN_CM      | 20    | Min detection range 0.2 m (conservative)     |
+| PRX1_MAX_CM      | 1200  | Max range 12 m (C1 spec)                     |
+| PRX1_ORIENT      | 0     | 0 = top-mounted; 1 = upside-down underneath  |
+| AVOID_ENABLE     | 3     | Bitmask: bit0 proximity + bit1 fence         |
+
+> **Note:** The A2 uses 115200 baud. The C1 runs at 460800 — using the wrong baud rate will result in no data being received.
+
+### References
+- ArduPilot RPLidar Setup: https://ardupilot.org/copter/docs/common-rplidar-a2.html
+- ArduPilot Parameter Reference: https://ardupilot.org/copter/docs/parameters.html
+- Slamtec RPLidar C1 Product Page: https://www.slamtec.com/en/c1
 
 ---
 
