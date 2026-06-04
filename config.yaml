@@ -55,7 +55,7 @@ nbv:
   revisit_radius_m:  5.0    # metres – radius considered "already visited"
 
 stream:
-  input:  "rtsp://192.168.192.200:8554/live"
+  input:  "rtsp://192.168.144.25:8554/main.264"
   output: "rtsp://0.0.0.0:8554/live"
 
 yolo:
