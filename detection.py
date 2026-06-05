@@ -13,15 +13,13 @@ model = YOLO(yolo_cfg["model"])
 # model.export(format="engine", half=True, dynamic=True)  # export to TensorRT engine for faster inference on Jetson Nano
 
 def watch_for(label: str, event: threading.Event) -> threading.Thread:
-    """Start a background thread that sets event when label is detected."""
+    """Start a persistent background thread that sets event whenever label is detected.
+    The thread keeps the RTSP stream open across NBV cycles — reset event externally to reuse."""
     def _run():
         for result in model(stream_cfg["input"], stream=True, conf=yolo_cfg["conf"],
                             imgsz=yolo_cfg["imgsz"], show=False, verbose=False):
             if label in [model.names[int(c)] for c in result.boxes.cls]:
                 event.set()
-                return
-            if event.is_set():
-                return
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()

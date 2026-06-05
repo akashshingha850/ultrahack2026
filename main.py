@@ -55,17 +55,16 @@ def main() -> None:
 
     wait_for_guided(vehicle)
 
+    person_detected = threading.Event()
+    detection.watch_for("person", person_detected)
+    log.debug("Detection thread started, watching for 'person'")
+
     while True:
+        person_detected.clear()
         log.info("Starting person search via NBV")
-        person_detected = threading.Event()
-        det_thread = detection.watch_for("person", person_detected)
-        log.debug("Detection thread started, watching for 'person'")
 
         nbv.nbv_loop(vehicle, cfg, stop_event=person_detected)
         log.info("NBV loop finished — person_detected=%s", person_detected.is_set())
-
-        person_detected.set()  # unblock detection thread if still running
-        det_thread.join(timeout=2)
 
     # mav.set_mode(vehicle, "RTL")
     # log.info("RTL commanded")
