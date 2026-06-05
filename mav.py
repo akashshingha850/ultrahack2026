@@ -15,10 +15,6 @@ from pymavlink import mavutil
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Connection
-# ---------------------------------------------------------------------------
-
 def connect(connection_string: str, baud: int = 57600,
             source_system: int = 255, timeout: int = 30) -> mavutil.mavfile:
     log.info("Connecting to %s …", connection_string)
@@ -59,87 +55,6 @@ def get_mode(vehicle: mavutil.mavfile) -> str:
     if hb is None:
         raise RuntimeError("No HEARTBEAT received")
     return mavutil.mode_string_v10(hb)
-
-
-# ---------------------------------------------------------------------------
-# Arming
-# ---------------------------------------------------------------------------
-
-def arm(vehicle: mavutil.mavfile, timeout: int = 10) -> None:
-    if _is_armed(vehicle):
-        log.info("Already armed")
-        return
-
-    current_altitude = _current_relative_alt(vehicle)
-    if current_altitude is not None and current_altitude > 1.0:
-        log.info("Already airborne at %.1f m – skipping arm", current_altitude)
-        return
-    log.info("Arming (force) …")
-    # param2 = 21196 is ArduPilot's magic value to bypass pre-arm checks.
-    vehicle.mav.command_long_send(
-        vehicle.target_system, vehicle.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0, 1, 21196, 0, 0, 0, 0, 0,
-    )
-    _wait_ack(vehicle, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout)
-    log.info("Armed")
-
-
-def disarm(vehicle: mavutil.mavfile, force: bool = False, timeout: int = 10) -> None:
-    log.info("Disarming …")
-    vehicle.mav.command_long_send(
-        vehicle.target_system, vehicle.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0, 0, 21196 if force else 0, 0, 0, 0, 0, 0,
-    )
-    _wait_ack(vehicle, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout)
-    log.info("Disarmed")
-
-
-def takeoff(vehicle: mavutil.mavfile, altitude: float, timeout: int = 30) -> None:
-    """GUIDED-mode takeoff to *altitude* metres AGL.
-
-    If the drone is already airborne (relative_alt > 0.5 m) – e.g. from a
-    previous RTL that hasn't landed yet – NAV_TAKEOFF is skipped and a
-    SET_POSITION_TARGET_LOCAL_NED climb is used instead, which ArduPilot
-    accepts in flight.
-    """
-    current_altitude = _current_relative_alt(vehicle)
-
-    if current_altitude is not None and current_altitude >= altitude - 1.0:
-        log.info("Already at %.1f m – skipping takeoff", current_altitude)
-        return
-
-    # Drone is airborne but below the target: climb via goto_ned, not NAV_TAKEOFF.
-    # ArduPilot rejects NAV_TAKEOFF (result=4) whenever the vehicle is not on the ground.
-    if current_altitude is not None and current_altitude > 0.5:
-        log.info("Already airborne at %.1f m – climbing to %.1f m via position target",
-                 current_altitude, altitude)
-        pos = get_local_position(vehicle)
-        goto_ned(vehicle, pos["north"], pos["east"], -altitude)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = vehicle.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=1)
-            if msg and msg.relative_alt / 1000.0 >= altitude - 1.0:
-                log.info("Reached %.1f m", msg.relative_alt / 1000.0)
-                return
-        raise RuntimeError(f"Could not climb to {altitude} m within {timeout} s")
-
-    log.info("Taking off to %.1f m …", altitude)
-    vehicle.mav.command_long_send(
-        vehicle.target_system, vehicle.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-        0, 0, 0, 0, 0, 0, 0, altitude,
-    )
-    _wait_ack(vehicle, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, timeout)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        msg = vehicle.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=1)
-        if msg and msg.relative_alt / 1000.0 >= altitude - 1.0:
-            log.info("Reached %.1f m", msg.relative_alt / 1000.0)
-            return
-    raise RuntimeError(f"Takeoff altitude {altitude} m not reached within {timeout} s")
-
 
 
 def goto_ned(vehicle: mavutil.mavfile,

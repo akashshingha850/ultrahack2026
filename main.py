@@ -1,24 +1,77 @@
+#!/usr/bin/env python3
+
+"""
+MISSION: ULTRAHACK 2026
+
+When the drone mode is GUIDED, explore via NBV until a "person" is
+detected from the camera stream, then RTL.
+"""
+
+import threading
+import logging
 import yaml
-import siyi
+
 import mav
+import nbv
+import detection
 
-import time
 
-with open("config.yaml") as f:
-    cfg = yaml.safe_load(f)
+def setup_logging(cfg: dict) -> None:
+    log_cfg = cfg.get("logging", {})
+    handlers = [logging.StreamHandler()]
+    if log_cfg.get("file"):
+        handlers.append(logging.FileHandler(log_cfg["file"]))
+    logging.basicConfig(
+        level=getattr(logging, log_cfg.get("level", "INFO").upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+    )
 
-conn_cfg = cfg.get("connection", {})
-vehicle = mav.connect(
-    conn_cfg.get("string"),
-    baud=conn_cfg.get("baud", 57600),
-    source_system=conn_cfg.get("source_system", 255),
-    timeout=conn_cfg.get("timeout", 30),
-)
 
-mav.move_forward_distance(vehicle, 10.0)  # move forward 10 metres
-mav.move_right_distance(vehicle, 8.0)     # move right 8 metres
-mav.move_backward_distance(vehicle, 6.0)  # move backward 6 metres
-mav.move_left_distance(vehicle, 4.0)    # move left 4 metres
+def wait_for_guided(vehicle) -> None:
+    mode = mav.get_mode(vehicle)
+    log.info("Current flight mode: %s", mode)
+    while mode != "GUIDED":
+        log.info("Waiting for GUIDED mode (currently %s)…", mode)
+        mode = mav.get_mode(vehicle)
+    log.info("GUIDED mode confirmed")
 
-#close connection
-mav.close(vehicle)
+
+def main() -> None:
+    with open("config.yaml") as f:
+        cfg = yaml.safe_load(f)
+
+    setup_logging(cfg)
+
+    global log
+    log = logging.getLogger("main")
+
+    conn = cfg["connection"]
+    log.debug("Connecting to vehicle at %s", conn["string"])
+    vehicle = mav.connect(conn["string"], baud=conn.get("baud", 57600),
+                          source_system=conn.get("source_system", 255),
+                          timeout=conn.get("timeout", 30))
+    log.info("Vehicle connected")
+
+    wait_for_guided(vehicle)
+
+    while True:
+        log.info("Starting person search via NBV")
+        person_detected = threading.Event()
+        det_thread = detection.watch_for("person", person_detected)
+        log.debug("Detection thread started, watching for 'person'")
+
+        nbv.nbv_loop(vehicle, cfg, stop_event=person_detected)
+        log.info("NBV loop finished — person_detected=%s", person_detected.is_set())
+
+        person_detected.set()  # unblock detection thread if still running
+        det_thread.join(timeout=2)
+
+    # mav.set_mode(vehicle, "RTL")
+    # log.info("RTL commanded")
+
+    # mav.close(vehicle)
+
+
+if __name__ == "__main__":
+    main()

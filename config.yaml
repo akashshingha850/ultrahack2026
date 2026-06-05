@@ -55,7 +55,8 @@ nbv:
   revisit_radius_m:  5.0    # metres – radius considered "already visited"
 
 stream:
-  input:  "rtsp://192.168.144.25:8554/main.264"
+  # input:  "rtsp://192.168.144.25:8554/main.264"
+  input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
   output: "rtsp://0.0.0.0:8554/live"
 
 yolo:
@@ -64,5 +65,5 @@ yolo:
   imgsz:      640            # inference input size (px)
 
 logging:
-  level: "INFO"             # DEBUG | INFO | WARNING | ERROR
-  file: "coverage_flight.log"
+  level: "DEBUG"             # DEBUG | INFO | WARNING | ERROR
+  file: "flight_log.log"

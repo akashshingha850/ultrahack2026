@@ -234,11 +234,11 @@ def score_candidates(
 # NBV flight loop
 # ---------------------------------------------------------------------------
 
-def nbv_loop(vehicle, cfg: dict) -> None:
+def nbv_loop(vehicle, cfg: dict, stop_event=None) -> None:
+    """Run NBV survey. If stop_event (threading.Event) is set mid-flight, exits early."""
     fl = cfg["flight"]
     altitude = float(fl["altitude"])
     speed = float(fl["speed"])
-    takeoff_alt = float(fl["takeoff_altitude"])
 
     cam = cfg.get("camera", {})
     hfov_deg = float(cam.get("hfov_deg", 82.6))
@@ -272,10 +272,6 @@ def nbv_loop(vehicle, cfg: dict) -> None:
 
     grid = InfoGrid(radius, resolution_m=grid_resolution)
 
-    # Arm and climb to survey altitude
-    mav.set_mode(vehicle, "GUIDED")
-    mav.arm(vehicle)
-    mav.takeoff(vehicle, takeoff_alt)
     mav.set_speed(vehicle, speed)
 
     down = -altitude
@@ -309,10 +305,18 @@ def nbv_loop(vehicle, cfg: dict) -> None:
                 log.info("Gain %.1f < min_gain %.1f – stopping", best.score, min_gain)
                 break
 
+            if stop_event and stop_event.is_set():
+                log.info("Stop event set before step %d – exiting NBV", step)
+                break
+
             # Fly to next-best viewpoint
             mav.goto_ned(vehicle, best.north, best.east, down, speed=speed)
             mav.wait_ned_reached(vehicle, best.north, best.east,
                                  radius=acceptance_r, timeout=wp_timeout)
+
+            if stop_event and stop_event.is_set():
+                log.info("Stop event set after reaching step %d – exiting NBV", step)
+                break
 
             # Record what was actually observed at the reached pose
             reached = mav.get_local_position(vehicle)
@@ -331,12 +335,9 @@ def nbv_loop(vehicle, cfg: dict) -> None:
                 break
 
     except KeyboardInterrupt:
-        log.warning("Interrupted – commanding RTL")
-        mav.rtl(vehicle)
-        return
+        log.warning("Interrupted")
 
     log.info("NBV complete – final coverage %.1f%%", grid.coverage() * 100)
-    mav.rtl(vehicle)
 
 
 # ---------------------------------------------------------------------------
