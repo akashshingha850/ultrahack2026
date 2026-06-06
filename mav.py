@@ -369,3 +369,30 @@ def _latest_message(vehicle: mavutil.mavfile, message_type: str):
         return messages.get(message_type)
     return None
 
+
+# ---------------------------------------------------------------------------
+# LiDAR data availability check
+# ---------------------------------------------------------------------------
+
+def check_lidar_available(vehicle: mavutil.mavfile, timeout: float = 3.0) -> bool:
+    """Return True if OBSTACLE_DISTANCE or DISTANCE_SENSOR data arrives within *timeout* s.
+
+    Preferred over parameter checks — works correctly in simulation where serial
+    port parameters differ from hardware but the proximity plugin still streams data.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        msg = vehicle.recv_match(
+            type=["OBSTACLE_DISTANCE", "DISTANCE_SENSOR"],
+            blocking=True,
+            timeout=0.5,
+        )
+        if msg is not None:
+            log.info("LiDAR data confirmed — message type: %s", msg.get_type())
+            return True
+    log.error(
+        "No OBSTACLE_DISTANCE or DISTANCE_SENSOR received in %.1f s — "
+        "check PRX1_TYPE and stream configuration", timeout
+    )
+    return False
+

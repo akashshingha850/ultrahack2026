@@ -3,38 +3,24 @@
 """
 MISSION: ULTRAHACK 2026
 
-When the drone mode is GUIDED, explore via NBV until a "person" is
-detected from the camera stream, then RTL.
+1. Wait for GUIDED mode.
+2. Spin 360° to build a room-frame LiDAR profile.
+3. Start YOLO person-detection in a background thread.
+4. Explore with a reactive boustrophedon sweep (parallel with detection).
+5. RTL on person found or max steps exhausted.
 """
 
-import threading
 import logging
+import threading
+import time
 import yaml
 
 import mav
-import nbv
 import detection
+import lidar as lidar_module
+from utils import setup_logging, wait_for_guided, collect_spin_profile, explore
 
-
-def setup_logging(cfg: dict) -> None:
-    log_cfg = cfg.get("logging", {})
-    handlers = [logging.StreamHandler()]
-    if log_cfg.get("file"):
-        handlers.append(logging.FileHandler(log_cfg["file"]))
-    logging.basicConfig(
-        level=getattr(logging, log_cfg.get("level", "INFO").upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=handlers,
-    )
-
-
-def wait_for_guided(vehicle) -> None:
-    mode = mav.get_mode(vehicle)
-    log.info("Current flight mode: %s", mode)
-    while mode != "GUIDED":
-        log.info("Waiting for GUIDED mode (currently %s)…", mode)
-        mode = mav.get_mode(vehicle)
-    log.info("GUIDED mode confirmed")
+log = logging.getLogger("main")
 
 
 def main() -> None:
@@ -43,33 +29,52 @@ def main() -> None:
 
     setup_logging(cfg)
 
-    global log
-    log = logging.getLogger("main")
-
+    # ── Connect ───────────────────────────────────────────────────────────
     conn = cfg["connection"]
-    log.debug("Connecting to vehicle at %s", conn["string"])
-    vehicle = mav.connect(conn["string"], baud=conn.get("baud", 57600),
-                          source_system=conn.get("source_system", 255),
-                          timeout=conn.get("timeout", 30))
+    vehicle = mav.connect(
+        conn["string"], baud=conn.get("baud", 57600),
+        source_system=conn.get("source_system", 255),
+        timeout=conn.get("timeout", 30),
+    )
     log.info("Vehicle connected")
+
+    # ── Detection starts immediately — runs for the entire mission ────────
+    person_found = threading.Event()
+    detection.watch_for("person", person_found)
+    log.info("Detection thread started")
+
+    if not mav.check_lidar_available(vehicle, timeout=3.0):
+        raise RuntimeError("No LiDAR data — check PRX1_TYPE and proximity plugin")
 
     wait_for_guided(vehicle)
 
-    person_detected = threading.Event()
-    detection.watch_for("person", person_detected)
-    log.debug("Detection thread started, watching for 'person'")
+    # ── Spin phase ────────────────────────────────────────────────────────
+    lidar_cfg = cfg.get("lidar", {})
+    lidar = lidar_module.LidarReader(vehicle)
+    lidar.request_streams()
+    time.sleep(0.5)
 
-    while True:
-        person_detected.clear()
-        log.info("Starting person search via NBV")
+    spin_dur   = lidar_cfg.get("spin_duration_s", 20.0)
+    spin_speed = lidar_cfg.get("spin_speed_deg_s", 20.0)
+    log.info("Starting 360° spin (%.0f °/s, %.0f s)", spin_speed, spin_dur)
+    mav.rotate_right(vehicle, 360, speed_deg_s=spin_speed)
+    room_profile = collect_spin_profile(vehicle, lidar, spin_duration=spin_dur)
+    log.info("Spin complete — %d/360 angles with valid range data",
+             int(sum(1 for v in room_profile if v != float("inf"))))
 
-        nbv.nbv_loop(vehicle, cfg, stop_event=person_detected)
-        log.info("NBV loop finished — person_detected=%s", person_detected.is_set())
+    # ── Exploration ───────────────────────────────────────────────────────
+    try:
+        explore(vehicle, lidar, person_found, cfg)
+    finally:
+        lidar.close()
 
-    # mav.set_mode(vehicle, "RTL")
-    # log.info("RTL commanded")
-
-    # mav.close(vehicle)
+    # ── RTL ───────────────────────────────────────────────────────────────
+    if person_found.is_set():
+        log.info("Person confirmed — RTL")
+    else:
+        log.warning("Exploration ended without detection — RTL")
+    mav.set_mode(vehicle, "RTL")
+    mav.close(vehicle)
 
 
 if __name__ == "__main__":
