@@ -66,6 +66,8 @@ class LidarReader:
                 continue
             with self._lock:
                 if msg.get_type() == "OBSTACLE_DISTANCE":
+                    valid_pts = sum(1 for d in msg.distances if 0 < d < 65535)
+                    log.debug("OBSTACLE_DISTANCE  valid_pts=%d/72", valid_pts)
                     self._latest_obstacle = msg
                     self._obstacle_event.set()
                 else:
@@ -159,12 +161,17 @@ class LidarReader:
             finite = vals[np.isfinite(vals)]
             return float(np.min(finite)) if len(finite) else np.inf
 
-        return {
+        walls = {
             "forward":  _arc_min(0),
             "right":    _arc_min(90),
             "backward": _arc_min(180),
             "left":     _arc_min(270),
         }
+        log.debug(
+            "lidar_walls  fwd=%.2f  right=%.2f  back=%.2f  left=%.2f m",
+            walls["forward"], walls["right"], walls["backward"], walls["left"],
+        )
+        return walls
 
     def get_sector_distance(self, angle_deg: float, width_deg: float = 10.0) -> float:
         """Return median distance (m) in the arc at *angle_deg* ± *width_deg*/2."""

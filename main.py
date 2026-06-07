@@ -73,8 +73,14 @@ def main() -> None:
         log.info("Person confirmed — RTL")
     else:
         log.warning("Exploration ended without detection — RTL")
-    mav.set_mode(vehicle, "RTL")
-    mav.close(vehicle)
+    try:
+        mav.set_mode(vehicle, "RTL")
+    except Exception as exc:
+        log.warning("RTL mode set failed: %s", exc)
+    try:
+        mav.close(vehicle)
+    except Exception as exc:
+        log.warning("Connection close error (ignored): %s", exc)
 
 
 if __name__ == "__main__":

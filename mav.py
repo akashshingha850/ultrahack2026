@@ -96,7 +96,36 @@ def get_local_position(vehicle: mavutil.mavfile) -> dict:
     msg = vehicle.recv_match(type="LOCAL_POSITION_NED", blocking=True, timeout=5)
     if msg is None:
         raise RuntimeError("No LOCAL_POSITION_NED received")
-    return {"north": msg.x, "east": msg.y, "down": msg.z}
+    pos = {"north": msg.x, "east": msg.y, "down": msg.z}
+    log.debug("position  N=%.2f  E=%.2f  D=%.2f m", pos["north"], pos["east"], pos["down"])
+    return pos
+
+
+def get_velocity(vehicle: mavutil.mavfile) -> dict:
+    """Return current body velocity {'vx', 'vy', 'vz'} in m/s from LOCAL_POSITION_NED."""
+    msg = vehicle.recv_match(type="LOCAL_POSITION_NED", blocking=True, timeout=5)
+    if msg is None:
+        raise RuntimeError("No LOCAL_POSITION_NED received")
+    vel = {"vx": msg.vx, "vy": msg.vy, "vz": msg.vz}
+    log.debug("velocity  vx=%.2f  vy=%.2f  vz=%.2f m/s", vel["vx"], vel["vy"], vel["vz"])
+    return vel
+
+
+def get_attitude(vehicle: mavutil.mavfile) -> dict:
+    """Return current attitude {'roll_deg', 'pitch_deg', 'yaw_deg'} from ATTITUDE."""
+    msg = _latest_message(vehicle, "ATTITUDE")
+    if msg is None:
+        msg = vehicle.recv_match(type="ATTITUDE", blocking=True, timeout=3)
+    if msg is None:
+        raise RuntimeError("No ATTITUDE received")
+    att = {
+        "roll_deg":  math.degrees(msg.roll),
+        "pitch_deg": math.degrees(msg.pitch),
+        "yaw_deg":   math.degrees(msg.yaw) % 360,
+    }
+    log.debug("attitude  roll=%.1f°  pitch=%.1f°  yaw=%.1f°",
+              att["roll_deg"], att["pitch_deg"], att["yaw_deg"])
+    return att
 
 
 def wait_ned_reached(vehicle: mavutil.mavfile,
@@ -109,7 +138,19 @@ def wait_ned_reached(vehicle: mavutil.mavfile,
     while time.time() < deadline:
         pos = get_local_position(vehicle)
         dist = math.sqrt((pos["north"] - north) ** 2 + (pos["east"] - east) ** 2)
-        log.debug("Distance to NED waypoint: %.1f m", dist)
+        try:
+            att = get_attitude(vehicle)
+            vel_msg = vehicle.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+            vx = vel_msg.vx if vel_msg else float("nan")
+            vy = vel_msg.vy if vel_msg else float("nan")
+        except Exception:
+            att = {"yaw_deg": float("nan")}
+            vx = vy = float("nan")
+        log.debug(
+            "wp_track  dist=%.1f m  N=%.2f E=%.2f D=%.2f  yaw=%.1f°  vx=%.2f vy=%.2f m/s",
+            dist, pos["north"], pos["east"], pos["down"],
+            att["yaw_deg"], vx, vy,
+        )
         if dist <= radius:
             return
         time.sleep(0.5)
@@ -360,6 +401,9 @@ def _current_yaw_rad(vehicle: mavutil.mavfile) -> float:
         msg = vehicle.recv_match(type="ATTITUDE", blocking=True, timeout=3)
     if msg is None:
         raise RuntimeError("No ATTITUDE message received")
+    log.debug("attitude  roll=%.1f°  pitch=%.1f°  yaw=%.1f°",
+              math.degrees(msg.roll), math.degrees(msg.pitch),
+              math.degrees(msg.yaw) % 360)
     return msg.yaw
 
 

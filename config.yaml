@@ -66,20 +66,19 @@ yolo:
 
 exploration:
   stop_dist_m:      2.0    # stop forward motion when a wall is this close (m)
-  speed_mps:        3.0    # forward sweep speed (m/s)
-  turn_speed_deg_s: 30.0   # yaw rate for 90° lane turns (deg/s)
+  speed_mps:        5.0    # forward sweep speed (m/s)
+  turn_speed_deg_s: 60.0   # yaw rate for 90° lane turns (deg/s)
   # SIYI A8 Mini HFOV 82.6° at 5 m AGL → ground swath ≈ 8.7 m.
-  # 6 m lane spacing gives 2.7 m overlap — safely covers a 3 m target.
-  # Covers 30 m room width in 5 passes for fastest possible search.
-  lane_width_m:     6.0
-  max_steps:        40     # hard cap on sweep segments
-  step_timeout_s:   30     # seconds allowed per forward segment
+  # 8 m lane spacing covers 30 m in 4 passes; still has ~0.7 m overlap.
+  lane_width_m:     8.0
+  max_steps:        16     # 30 m / 8 m lanes = 4 lanes → 8 fwd + 8 shifts = 16 steps
+  step_timeout_s:   12     # 40 m / 5 m/s = 8 s; 12 s gives margin
 
 lidar:
   obstacle_distance_rate_hz: 10
   stream_timeout_s: 2.0
-  spin_duration_s: 20.0
-  spin_speed_deg_s: 20.0
+  spin_duration_s: 12.0    # 360° / 30 deg/s = 12 s; fast enough for one full rotation
+  spin_speed_deg_s: 30.0
   min_valid_range_m: 0.2
   max_valid_range_m: 12.0
 

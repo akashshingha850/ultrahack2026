@@ -72,6 +72,8 @@ def collect_spin_profile(vehicle, lidar, spin_duration: float = 20.0) -> np.ndar
         try:
             profile_body = lidar.get_polar_profile(timeout=0.5)
             yaw_deg = math.degrees(mav._current_yaw_rad(vehicle)) % 360
+            valid_pts = int(np.sum(np.isfinite(profile_body)))
+            log.debug("spin_snapshot  yaw=%.1f°  valid_pts=%d/360", yaw_deg, valid_pts)
             profiles.append(np.roll(profile_body, int(round(yaw_deg))))
         except TimeoutError:
             log.debug("LiDAR timeout during spin — skipping snapshot")
@@ -102,17 +104,47 @@ def _sweep_forward(vehicle, lidar, person_found: threading.Event,
     import mav
     mav.move_forward_speed(vehicle, speed)
     deadline = time.time() + timeout
+    _last_debug = time.time()
     while time.time() < deadline:
         if person_found.is_set():
             mav.move_forward_speed(vehicle, 0)
             return "person"
         if not _forward_clear(lidar, stop_dist):
             mav.move_forward_speed(vehicle, 0)
-            log.info("Wall within %.1f m — ending sweep segment", stop_dist)
+            try:
+                pos = mav.get_local_position(vehicle)
+                log.info("Wall within %.1f m — pos N=%.1f E=%.1f D=%.1f m",
+                         stop_dist, pos["north"], pos["east"], pos["down"])
+            except Exception:
+                log.info("Wall within %.1f m — ending sweep segment", stop_dist)
             return "wall"
+        now = time.time()
+        if now - _last_debug >= 1.0:
+            try:
+                pos = mav.get_local_position(vehicle)
+                att = mav.get_attitude(vehicle)
+                vel = mav.get_velocity(vehicle)
+                walls = lidar.get_wall_distances(timeout=0.5)
+                log.debug(
+                    "sweep  pos N=%.2f E=%.2f D=%.2f m  yaw=%.1f°  "
+                    "vel vx=%.2f vy=%.2f vz=%.2f m/s  "
+                    "lidar fwd=%.2f right=%.2f back=%.2f left=%.2f m",
+                    pos["north"], pos["east"], pos["down"],
+                    att["yaw_deg"],
+                    vel["vx"], vel["vy"], vel["vz"],
+                    walls["forward"], walls["right"], walls["backward"], walls["left"],
+                )
+            except Exception as exc:
+                log.debug("sweep debug telemetry unavailable: %s", exc)
+            _last_debug = now
         time.sleep(0.1)
     mav.move_forward_speed(vehicle, 0)
-    log.warning("Sweep segment timed out after %.0f s", timeout)
+    try:
+        pos = mav.get_local_position(vehicle)
+        log.warning("Sweep segment timed out after %.0f s  pos N=%.1f E=%.1f D=%.1f m",
+                    timeout, pos["north"], pos["east"], pos["down"])
+    except Exception:
+        log.warning("Sweep segment timed out after %.0f s", timeout)
     return "wall"
 
 
@@ -130,12 +162,24 @@ def explore(vehicle, lidar, person_found: threading.Event, cfg: dict) -> None:
     direction = 1   # +1 = turn CW at wall, -1 = turn CCW
     steps = 0
 
-    log.info("Exploration start — speed=%.1f m/s  lane=%.1f m  stop=%.1f m  max_steps=%d",
-             speed, lane_width, stop_dist, max_steps)
+    try:
+        p0 = mav.get_local_position(vehicle)
+        log.info("Exploration start — speed=%.1f m/s  lane=%.1f m  stop=%.1f m  max_steps=%d  "
+                 "origin N=%.1f E=%.1f D=%.1f m",
+                 speed, lane_width, stop_dist, max_steps,
+                 p0["north"], p0["east"], p0["down"])
+    except Exception:
+        log.info("Exploration start — speed=%.1f m/s  lane=%.1f m  stop=%.1f m  max_steps=%d",
+                 speed, lane_width, stop_dist, max_steps)
 
     while steps < max_steps:
         steps += 1
-        log.info("Sweep %d/%d", steps, max_steps)
+        try:
+            pos = mav.get_local_position(vehicle)
+            log.info("Sweep %d/%d  pos N=%.1f E=%.1f D=%.1f m",
+                     steps, max_steps, pos["north"], pos["east"], pos["down"])
+        except Exception:
+            log.info("Sweep %d/%d", steps, max_steps)
 
         # Forward sweep
         if _sweep_forward(vehicle, lidar, person_found,
@@ -169,4 +213,9 @@ def explore(vehicle, lidar, person_found: threading.Event, cfg: dict) -> None:
 
         direction *= -1   # alternate sweep direction
 
-    log.warning("Max exploration steps reached without detection")
+    try:
+        pos = mav.get_local_position(vehicle)
+        log.warning("Max exploration steps reached without detection  pos N=%.1f E=%.1f D=%.1f m",
+                    pos["north"], pos["east"], pos["down"])
+    except Exception:
+        log.warning("Max exploration steps reached without detection")

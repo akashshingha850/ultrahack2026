@@ -62,8 +62,8 @@ def watch_for(label: str, event: threading.Event) -> threading.Thread:
                         event.set()
 
             except Exception as exc:
-                log.warning("Detection stream error: %s — retrying in 2 s", exc)
-                time.sleep(2)
+                log.warning("Detection stream error: %s — retrying in 1 s", exc)
+                time.sleep(1)
 
     t = threading.Thread(target=_run, daemon=True, name="detection")
     t.start()
