@@ -4,10 +4,11 @@
 MISSION: ULTRAHACK 2026
 
 1. Wait for GUIDED mode.
-2. Spin 360° to build a room-frame LiDAR profile.
+2. Spin 360° to build a room-frame LiDAR profile (initial localisation).
 3. Start YOLO person-detection in a background thread.
-4. Explore with a reactive boustrophedon sweep (parallel with detection).
-5. RTL on person found or max steps exhausted.
+4. Survey a grid of waypoints sized to the arena; spin 360° at each stop so
+   the camera (10-12 m detection range) sweeps the area between visits.
+5. RTL on person found or survey exhausted.
 """
 
 import logging
@@ -18,7 +19,7 @@ import yaml
 import mav
 import detection
 import lidar as lidar_module
-from utils import setup_logging, wait_for_guided, collect_spin_profile, explore
+from utils import setup_logging, wait_for_guided, collect_spin_profile, open_path_explore
 
 log = logging.getLogger("main")
 
@@ -48,7 +49,10 @@ def main() -> None:
 
     wait_for_guided(vehicle)
 
-    # ── Spin phase ────────────────────────────────────────────────────────
+    # ── Initial spin ──────────────────────────────────────────────────────
+    # One quick 360° at the start position: cheap insurance for a person who is
+    # beside/behind the drone at launch, and a chance to detect before we move.
+    # Cancels itself early the instant the camera sees the target.
     lidar_cfg = cfg.get("lidar", {})
     lidar = lidar_module.LidarReader(vehicle)
     lidar.request_streams()
@@ -58,25 +62,32 @@ def main() -> None:
     spin_speed = lidar_cfg.get("spin_speed_deg_s", 20.0)
     log.info("Starting 360° spin (%.0f °/s, %.0f s)", spin_speed, spin_dur)
     mav.rotate_right(vehicle, 360, speed_deg_s=spin_speed)
-    room_profile = collect_spin_profile(vehicle, lidar, spin_duration=spin_dur)
+    room_profile = collect_spin_profile(vehicle, lidar, spin_duration=spin_dur,
+                                         person_found=person_found, spin_speed=spin_speed)
     log.info("Spin complete — %d/360 angles with valid range data",
              int(sum(1 for v in room_profile if v != float("inf"))))
 
-    # ── Exploration ───────────────────────────────────────────────────────
+    # ── Coverage search ───────────────────────────────────────────────────
+    # Reactive open-path explorer: cruise through open space using all 8 LiDAR
+    # beams, stop at walls and turn toward the most-open direction. Camera
+    # detects continuously while moving (see open_path_explore docstring).
     try:
-        explore(vehicle, lidar, person_found, cfg)
+        if person_found.is_set():
+            log.info("Person already detected during initial spin — skipping coverage search")
+        else:
+            open_path_explore(vehicle, lidar, person_found, cfg)
     finally:
         lidar.close()
 
-    # ── RTL ───────────────────────────────────────────────────────────────
+    # ── LAND ───────────────────────────────────────────────────────────────
     if person_found.is_set():
-        log.info("Person confirmed — RTL")
+        log.info("Person confirmed — LAND")
     else:
-        log.warning("Exploration ended without detection — RTL")
+        log.warning("Exploration ended without detection — LAND")
     try:
-        mav.set_mode(vehicle, "RTL")
+        mav.set_mode(vehicle, "LAND")
     except Exception as exc:
-        log.warning("RTL mode set failed: %s", exc)
+        log.warning("LAND mode set failed: %s", exc)
     try:
         mav.close(vehicle)
     except Exception as exc:

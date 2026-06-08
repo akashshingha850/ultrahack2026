@@ -26,7 +26,11 @@ class LidarReader:
         self._vehicle = vehicle
         self._lock = threading.Lock()
         self._latest_obstacle = None   # raw OBSTACLE_DISTANCE msg
-        self._latest_distance = None   # raw DISTANCE_SENSOR msg
+        self._latest_distance = None   # most-recent DISTANCE_SENSOR msg (any orientation)
+        # SITL streams one DISTANCE_SENSOR per orientation (0..7 = 45° steps,
+        # MAV_SENSOR_ROTATION_YAW_*). Keep the latest of EACH so we can build a
+        # real 360° profile instead of discarding 7 of every 8 beams.
+        self._distance_by_orient: dict[int, object] = {}
         self._stop_event = threading.Event()
         self._obstacle_event = threading.Event()  # set each time a new OBSTACLE_DISTANCE arrives
 
@@ -71,13 +75,14 @@ class LidarReader:
                     self._latest_obstacle = msg
                     self._obstacle_event.set()
                 else:
-                    # DISTANCE_SENSOR fallback (common in SITL when no
-                    # full 360° proximity plugin is active)
+                    # DISTANCE_SENSOR — SITL sends 8 of these (one per 45°
+                    # orientation). Keep the latest of every orientation so a
+                    # full 360° profile can be synthesised from all beams.
                     self._latest_distance = msg
+                    self._distance_by_orient[int(msg.orientation)] = msg
                     if self._latest_obstacle is None:
-                        # Synthesise a minimal obstacle message so callers
-                        # don't block forever; real OBSTACLE_DISTANCE takes
-                        # priority as soon as it arrives.
+                        # No full OBSTACLE_DISTANCE plugin — drive callers from
+                        # the per-orientation DISTANCE_SENSOR set instead.
                         self._obstacle_event.set()
 
     # ------------------------------------------------------------------
@@ -100,28 +105,82 @@ class LidarReader:
             )
 
         with self._lock:
-            obs_msg  = self._latest_obstacle
-            dist_msg = self._latest_distance
+            obs_msg     = self._latest_obstacle
+            dist_orient = dict(self._distance_by_orient)
 
         # --- Preferred path: full 360° OBSTACLE_DISTANCE ---
         if obs_msg is not None:
             return self._parse_obstacle_distance(obs_msg)
 
-        # --- Fallback: single-beam DISTANCE_SENSOR (SITL rangefinder) ---
-        # Synthesise a 360° profile with the forward reading only.
-        log.debug("No OBSTACLE_DISTANCE yet — synthesising profile from DISTANCE_SENSOR")
+        # --- Fallback: 8-beam DISTANCE_SENSOR set (SITL proximity) ---
+        # Each orientation o (0..7) points at o*45° in body frame. Fill a ±23°
+        # wedge around each beam so the eight beams tile the full circle.
+        # A reading at/over the sensor's max_distance means "nothing within
+        # range" → leave that wedge as inf (open), NOT a wall at max range.
         profile = np.full(360, np.inf, dtype=np.float32)
-        if dist_msg is not None:
-            d_cm = float(dist_msg.current_distance)
-            orientation = getattr(dist_msg, "orientation", 0)
-            # MAVLink MAV_SENSOR_ORIENTATION: 0=forward, 6=right, 12=back, 18=left
-            _orient_to_deg = {0: 0, 6: 90, 12: 180, 18: 270}
-            center_deg = _orient_to_deg.get(orientation, 0)
-            if 0 < d_cm < 65535:
-                d_m = d_cm / 100.0
-                for deg in range(center_deg - 5, center_deg + 5):
-                    profile[deg % 360] = d_m
+        filled = []
+        for orient, msg in dist_orient.items():
+            d_m = self._beam_distance(msg)
+            if not math.isfinite(d_m):
+                continue
+            center_deg = int(round(orient * 45)) % 360
+            for deg in range(center_deg - 23, center_deg + 23):
+                profile[deg % 360] = d_m
+            filled.append((center_deg, d_m))
+        log.debug("Synthesised 360° profile from %d/8 DISTANCE_SENSOR beams: %s",
+                  len(dist_orient),
+                  "  ".join(f"{deg}°={d:.1f}m" for deg, d in sorted(filled)) or "all open/out-of-range")
         return profile
+
+    @staticmethod
+    def _beam_distance(msg) -> float:
+        """One DISTANCE_SENSOR beam → clearance in metres, or inf for
+        open / out-of-range / invalid (so max-range never looks like a wall)."""
+        d_cm   = float(msg.current_distance)
+        min_cm = float(getattr(msg, "min_distance", 0) or 0)
+        max_cm = float(getattr(msg, "max_distance", 0) or 0)
+        if d_cm <= 0 or d_cm >= 65535:
+            return float("inf")
+        if max_cm and d_cm >= max_cm:        # at/over max range → open
+            return float("inf")
+        if min_cm and d_cm < min_cm:         # below min range → unreliable
+            return float("inf")
+        return d_cm / 100.0
+
+    def get_directions(self, timeout: float = 2.0) -> dict:
+        """Body-frame clearance (m) for each of the 8 LiDAR beams:
+        {0, 45, 90, 135, 180, 225, 270, 315} → distance, inf = open.
+
+        0° = dead ahead, 90° = right, 180° = behind, 270° = left. Read straight
+        from the per-orientation DISTANCE_SENSOR set (or derived from a real
+        OBSTACLE_DISTANCE if present), so each value is a single clean beam with
+        no cross-bleed between neighbours. This is the primary input for the
+        reactive open-path explorer.
+        """
+        self._obstacle_event.clear()
+        if not self._obstacle_event.wait(timeout=timeout):
+            raise TimeoutError(f"No LiDAR message within {timeout:.1f} s")
+
+        with self._lock:
+            obs_msg     = self._latest_obstacle
+            dist_orient = dict(self._distance_by_orient)
+
+        dirs = {a: float("inf") for a in range(0, 360, 45)}
+
+        if obs_msg is not None:
+            profile = self._parse_obstacle_distance(obs_msg)
+            for a in dirs:
+                seg = profile[np.arange(a - 20, a + 20) % 360]
+                fin = seg[np.isfinite(seg)]
+                dirs[a] = float(np.min(fin)) if len(fin) else float("inf")
+        else:
+            for orient, msg in dist_orient.items():
+                dirs[(int(orient) * 45) % 360] = self._beam_distance(msg)
+
+        log.debug("lidar 8-dir(body)  " + "  ".join(
+            f"{a}°={('%.1f' % d) if math.isfinite(d) else 'inf'}"
+            for a, d in sorted(dirs.items())))
+        return dirs
 
     def _parse_obstacle_distance(self, msg) -> np.ndarray:
         distances_cm = np.array(msg.distances, dtype=np.float32)   # 72 uint16 values
@@ -167,9 +226,16 @@ class LidarReader:
             "backward": _arc_min(180),
             "left":     _arc_min(270),
         }
+        # Full 8-direction breakdown (body frame) so the logs show exactly what
+        # the LiDAR sees all around, not just the 4 cardinals.
+        def _fmt(c):
+            v = _arc_min(c, half_width=22)
+            return f"{v:.1f}" if np.isfinite(v) else "inf"
         log.debug(
-            "lidar_walls  fwd=%.2f  right=%.2f  back=%.2f  left=%.2f m",
+            "lidar_walls(body)  fwd=%.2f right=%.2f back=%.2f left=%.2f m  |  "
+            "8-dir 0°=%s 45°=%s 90°=%s 135°=%s 180°=%s 225°=%s 270°=%s 315°=%s m",
             walls["forward"], walls["right"], walls["backward"], walls["left"],
+            _fmt(0), _fmt(45), _fmt(90), _fmt(135), _fmt(180), _fmt(225), _fmt(270), _fmt(315),
         )
         return walls
 

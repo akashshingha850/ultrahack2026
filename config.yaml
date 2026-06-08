@@ -37,6 +37,18 @@ waypoint:
   loiter_time: 0            # seconds to loiter at each waypoint (0 = pass-through)
   timeout: 300              # seconds to wait for each waypoint before aborting
 
+# Survey-grid mission: fly to a handful of stops and spin 360° at each so the
+# camera (10-12 m detection range) covers the whole arena between them.
+# Start position is random (mission.md), so the grid is laid out *relative to
+# the start* and assumed centred in the arena — edge_margin_m shrinks the grid
+# so off-centre starts are less likely to push a stop through a wall.
+mission:
+  arena_length_m:    60.0   # long axis
+  arena_width_m:     30.0   # short axis
+  num_waypoints:     6
+  detection_range_m: 12.0   # camera person-detection radius per 360° spin
+  edge_margin_m:     6.0    # keep grid stops this far inside the assumed walls
+
 nbv:
   coverage_target:   0.90   # stop when this fraction of the survey circle is observed
   max_steps:         100    # hard cap on NBV iterations
@@ -55,8 +67,8 @@ nbv:
   revisit_radius_m:  5.0    # metres – radius considered "already visited"
 
 stream:
-  input:  "rtsp://192.168.144.25:8554/main.264"
-  # input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
+  # input:  "rtsp://192.168.144.25:8554/main.264"
+  input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
   output: "rtsp://0.0.0.0:8554/live"
 
 yolo:
@@ -65,7 +77,13 @@ yolo:
   imgsz:      640            # inference input size (px)
 
 exploration:
-  stop_dist_m:      2.0    # stop forward motion when a wall is this close (m)
+  # Replan distance for open_path_explore. Set ABOVE ArduPilot's OA distance
+  # (OA_BR_LOOKAHEAD≈3 m, AVOID_MARGIN≈2 m) so our code turns toward an open
+  # direction BEFORE the FC's avoidance ever brakes the guided command — that
+  # fighting pinned the drone near 0 m/s (logs/2026-06-08_03-32-27.log). The
+  # camera detects within ~5–6 m, so stopping 5 m short still means that spot
+  # was already covered. 5 m → we redirect early and keep full speed.
+  stop_dist_m:      5.0    # replan when a wall is this close ahead (m)
   speed_mps:        5.0    # forward sweep speed (m/s)
   turn_speed_deg_s: 60.0   # yaw rate for 90° lane turns (deg/s)
   # SIYI A8 Mini HFOV 82.6° at 5 m AGL → ground swath ≈ 8.7 m.
@@ -77,11 +95,11 @@ exploration:
 lidar:
   obstacle_distance_rate_hz: 10
   stream_timeout_s: 2.0
-  spin_duration_s: 12.0    # 360° / 30 deg/s = 12 s; fast enough for one full rotation
-  spin_speed_deg_s: 30.0
+  spin_duration_s: 8.0     # 360° / 45 deg/s = 8 s; trims ~4 s of stationary time per stop
+  spin_speed_deg_s: 45.0   # also cancellable mid-spin the instant a person is detected
   min_valid_range_m: 0.2
   max_valid_range_m: 12.0
 
 logging:
-  level: "INFO"             # DEBUG | INFO | WARNING | ERROR
+  level: "DEBUG"             # DEBUG | INFO | WARNING | ERROR
   dir: "logs"               # log files written here as logs/YYYY-MM-DD_HH-MM-SS.log
