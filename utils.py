@@ -838,13 +838,24 @@ def open_path_explore(vehicle, lidar, person_found: threading.Event, cfg: dict) 
         log.info("Open-path — new waypoint (%s) → N=%.1f E=%.1f  heading=%.0f°  "
                  "8-dir=%s", reason, wp_n, wp_e, math.degrees(head) % 360,
                  {k: (round(v, 1) if math.isfinite(v) else "inf") for k, v in sorted(dirs.items())})
-        return (wp_n, wp_e)
+        return (wp_n, wp_e, head)
 
-    deadline   = time.time() + time_budget
-    wp         = None
-    last_send  = 0.0
-    last_prog  = time.time()
-    last_pos   = None
+    def _clear_toward(dirs, heading_rad):
+        """Clearance (m) in the direction of *heading_rad*, from the body beams —
+        i.e. how open the path toward the current waypoint is, regardless of
+        which way the nose currently points (so we don't replan off a stale
+        body-0 reading while still yawing onto a new leg)."""
+        body_deg = int(round(math.degrees(heading_rad - _yaw()) / 45.0)) * 45 % 360
+        return dirs.get(body_deg, float("inf"))
+
+    deadline    = time.time() + time_budget
+    wp          = None
+    cur_head    = None
+    last_send   = 0.0
+    last_prog   = time.time()
+    last_replan = 0.0
+    last_pos    = None
+    commit_s    = 1.2          # minimum time to commit to a leg before a wall-replan
 
     while time.time() < deadline:
         if person_found.is_set():
@@ -857,7 +868,6 @@ def open_path_explore(vehicle, lidar, person_found: threading.Event, cfg: dict) 
         _mark(pos)
 
         dirs = _dirs()
-        fwd  = dirs.get(0, float("inf"))
         now  = time.time()
 
         # progress / stuck tracking
@@ -867,15 +877,21 @@ def open_path_explore(vehicle, lidar, person_found: threading.Event, cfg: dict) 
         last_pos = pos
 
         reached = wp is not None and math.hypot(wp[0] - pos["north"], wp[1] - pos["east"]) <= accept_rad
-        wall    = fwd <= replan_dist
-        stuck   = (now - last_prog) > stuck_s
+        # Wall check is along the CURRENT heading (not stale body-0), and only
+        # after a short commit window so we don't thrash while yawing onto the
+        # leg (the 11×/18 s replan stall in logs/2026-06-08_04-00-26.log).
+        toward = _clear_toward(dirs, cur_head) if cur_head is not None else float("inf")
+        wall   = (cur_head is not None) and toward <= replan_dist and (now - last_replan) >= commit_s
+        stuck  = (now - last_prog) > stuck_s
 
         if wp is None or reached or wall or stuck:
-            reason = "init" if wp is None else ("wall %.1f m" % fwd if wall else
-                     ("arrived" if reached else "stuck"))
-            wp = _new_waypoint(pos, dirs, reason)
+            reason = ("init" if wp is None else
+                      ("wall %.1f m" % toward if wall else ("arrived" if reached else "stuck")))
+            wp_n, wp_e, cur_head = _new_waypoint(pos, dirs, reason)
+            wp = (wp_n, wp_e)
             last_send = now
             last_prog = now
+            last_replan = now
         elif now - last_send >= keepalive_s:
             # Re-send the SAME waypoint to keep GUIDED alive WITHOUT restarting
             # the S-curve (moving the target every loop is what kept speed ~0).
@@ -885,9 +901,9 @@ def open_path_explore(vehicle, lidar, person_found: threading.Event, cfg: dict) 
                 vel = mav.get_velocity(vehicle); sp = math.hypot(vel["vx"], vel["vy"])
             except Exception:
                 sp = float("nan")
-            log.debug("Open-path cruise  pos N=%.1f E=%.1f  spd=%.1f m/s  fwd=%.1f  "
+            log.debug("Open-path cruise  pos N=%.1f E=%.1f  spd=%.1f m/s  toward=%.1f  "
                       "wp N=%.1f E=%.1f  rem=%.1f m  cells=%d",
-                      pos["north"], pos["east"], sp, fwd, wp[0], wp[1],
+                      pos["north"], pos["east"], sp, toward, wp[0], wp[1],
                       math.hypot(wp[0]-pos["north"], wp[1]-pos["east"]), len(visited))
         time.sleep(0.2)
 
