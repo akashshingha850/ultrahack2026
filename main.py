@@ -104,10 +104,6 @@ def main() -> None:
         mav.set_mode(vehicle, "BRAKE")
     except Exception as exc:
         log.warning("BRAKE mode set failed: %s", exc)
-    try:
-        mav.close(vehicle)
-    except Exception as exc:
-        log.warning("Connection close error (ignored): %s", exc)
 
 
 if __name__ == "__main__":

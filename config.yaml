@@ -69,18 +69,18 @@ nbv:
 stream:
   # input:  "rtsp://192.168.144.25:8554/main.264"
   input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
-  output: "rtsp://0.0.0.0:8554/live"
+  output: "rtsp://0.0.0.0:8555/live"
 
 yolo:
-  model:      "yolo26s.pt"   # model weights file (downloaded automatically if missing)
-  conf:       0.35           # minimum confidence threshold
+  model:      "ultrahack2026.engine"   # model weights file (downloaded automatically if missing)
+  conf:       0.5           # minimum confidence threshold
   imgsz:      640            # inference input size (px)
 
 # Visual-servo approach: once the target class is detected, creep toward it
 # while keeping the bottom-centre of its bounding box at the frame centre, and
 # stop when the forward LiDAR is within stop_dist_m.
 approach:
-  target_class:     "person"   # YOLO class to detect and home in on
+  target_class:     "smoke"   # YOLO class to detect and home in on
   stop_dist_m:      3.0        # halt when the forward beam reads ≤ this (m)
   speed_mps:        1.0        # gentle forward creep speed (m/s)
   yaw_gain:         1.2        # err_x ∈ [-1,1] → yaw rate gain
