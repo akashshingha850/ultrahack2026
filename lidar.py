@@ -239,16 +239,6 @@ class LidarReader:
         )
         return walls
 
-    def get_sector_distance(self, angle_deg: float, width_deg: float = 10.0) -> float:
-        """Return median distance (m) in the arc at *angle_deg* ± *width_deg*/2."""
-        profile = self.get_polar_profile()
-        half = int(round(width_deg / 2.0))
-        center = int(round(angle_deg)) % 360
-        indices = np.arange(center - half, center + half) % 360
-        vals = profile[indices]
-        finite = vals[np.isfinite(vals)]
-        return float(np.median(finite)) if len(finite) else np.inf
-
     def close(self) -> None:
         self._stop_event.set()
         self._thread.join(timeout=2.0)
@@ -308,18 +298,10 @@ if __name__ == "__main__":
             float(np.mean(finite)) if len(finite) else 0,
         )
 
-        walls = lidar.get_wall_distances.__wrapped__(lidar) if hasattr(
-            lidar.get_wall_distances, "__wrapped__") else None
-        walls = {
-            "forward":  float(np.min(profile[np.arange(-30, 30) % 360][
-                np.isfinite(profile[np.arange(-30, 30) % 360])]) if True else np.inf),
-            "right":    float(np.min(profile[np.arange(60, 120)][
-                np.isfinite(profile[np.arange(60, 120)])]) if True else np.inf),
-            "backward": float(np.min(profile[np.arange(150, 210)][
-                np.isfinite(profile[np.arange(150, 210)])]) if True else np.inf),
-            "left":     float(np.min(profile[np.arange(240, 300)][
-                np.isfinite(profile[np.arange(240, 300)])]) if True else np.inf),
-        }
+        walls = lidar.get_wall_distances(timeout=2.0)
+        dirs  = lidar.get_directions(timeout=2.0)
+        log.info("8-dir(body): %s", "  ".join(
+            f"{a}°={('%.1f' % d) if np.isfinite(d) else 'inf'}" for a, d in sorted(dirs.items())))
 
         bar_max = 12.0
         bar_len = 30

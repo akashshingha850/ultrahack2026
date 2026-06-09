@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # Load a YOLO26n PyTorch model
-model = YOLO("fireman_yolo26s_taufiq.pt")
+model = YOLO("ultrahack2026.pt")
 
 # Export the model to TensorRT
 model.export(format="engine", half=True, )  # creates 'yolo26n.engine'

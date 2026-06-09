@@ -1,4 +1,4 @@
-# Autonomous Drone Survey System
+ <   # Autonomous Drone Survey System
 
 Autonomous aerial survey stack for ArduPilot-based drones. Covers MAVLink flight control, coverage path planning (lawnmower / spiral), next-best-view exploration, YOLO object detection, and SIYI gimbal control — all driven from a single `config.yaml`.
 
@@ -12,7 +12,8 @@ Autonomous aerial survey stack for ArduPilot-based drones. Covers MAVLink flight
 | `mav.py` | MAVLink / ArduPilot interface (arm, takeoff, movement, telemetry) |
 | `cpp.py` | Coverage path planner — boustrophedon or hexagonal spiral |
 | `nbv.py` | Next-Best-View autonomous survey planner |
-| `detection.py` | Real-time YOLO object detection from RTSP stream |
+| `detection.py` | Real-time YOLO object detection from RTSP stream; publishes the latest target bounding box for the approach loop |
+| `utils.py` | Mission helpers — LiDAR spin, `open_path_explore`, `approach_target` |
 | `siyi.py` | SIYI A8 Mini gimbal control (attitude, recording) |
 
 ---
@@ -62,6 +63,12 @@ yolo:
 
 stream:
   input: "rtsp://192.168.192.200:8554/live"
+
+approach:               # visual-servo approach once the target is detected
+  target_class: "person"  # YOLO class to detect and home in on
+  stop_dist_m: 3.0        # stop when the front LiDAR is within this range (m)
+  speed_mps: 1.0          # gentle forward creep speed (m/s)
+  yaw_gain: 1.2           # bbox horizontal error → yaw rate gain
 ```
 
 The survey radius is read automatically from the vehicle's `FENCE_RADIUS` parameter. Pass `--radius` only for dry runs.
@@ -110,10 +117,12 @@ python main.py
 
 Runs the actual mission (see [`mission.md`](mission.md) for the brief): connect →
 start YOLO detection thread → 360° LiDAR spin to build an initial room profile →
-`survey_waypoints()` flies a grid of stops sized to the arena, spinning 360° at
-each so the camera (10–12 m detection range) sweeps the gaps between stops →
-RTL on person-found or survey-exhausted. See **Mission flow & debugging** below
-for how to read the logs this produces.
+`open_path_explore()` roams the arena reactively from the 8/360° LiDAR beams,
+cruising open space and turning at walls while the camera detects continuously →
+on detection, `approach_target()` creeps toward the person, yawing to keep the
+bottom-centre of its bounding box at the frame centre until the **front LiDAR is
+within `approach.stop_dist_m` (3 m)** → **BRAKE** (RTL skipped for now). See
+**Mission flow & debugging** below for how to read the logs this produces.
 
 ---
 
@@ -195,6 +204,10 @@ overrides the grid guess:
 | `Stop N/M  octant min-dist (room frame, compass-relative)  N=... NE=...` (DEBUG) | 8-way breakdown — use to sanity-check whether the cardinal readings are representative or got unlucky with a 5° sector miss |
 | `Arena bounds tightened from spin at ...` | A spin narrowed the known arena bounding box — running estimate printed at survey end too |
 | `Detected: <label> <confidence>` / `TARGET 'person' FOUND` | YOLO detections from the background `detection` thread (runs in parallel — interleaved with everything else in the log) |
+| `Approach — creep ... toward target ...` | The approach loop started after a detection — creeping toward the target, centring the bbox |
+| `Approach  err_x=... yaw_rate=... vx=... front=... conf=...` (DEBUG) | Per-cycle visual-servo telemetry: horizontal bbox error, commanded yaw rate & forward speed, front LiDAR range |
+| `Approach — front LiDAR X m ≤ Y m: stopping at target` | Reached the target — front beam within `approach.stop_dist_m`, motion halted |
+| `Approach — target lost for >Ns, giving up` | Detection dropped out mid-approach beyond `approach.lost_grace_s` |
 
 ### Common things to check when a run "takes too long" or behaves oddly
 

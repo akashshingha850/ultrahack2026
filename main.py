@@ -19,7 +19,10 @@ import yaml
 import mav
 import detection
 import lidar as lidar_module
-from utils import setup_logging, wait_for_guided, collect_spin_profile, open_path_explore
+from utils import (
+    setup_logging, wait_for_guided, climb_to, collect_spin_profile,
+    open_path_explore, approach_target,
+)
 
 log = logging.getLogger("main")
 
@@ -40,9 +43,10 @@ def main() -> None:
     log.info("Vehicle connected")
 
     # ── Detection starts immediately — runs for the entire mission ────────
-    person_found = threading.Event()
-    detection.watch_for("person", person_found)
-    log.info("Detection thread started")
+    target_class = cfg.get("approach", {}).get("target_class", "person")
+    target_found = threading.Event()
+    detection.watch_for(target_class, target_found)
+    log.info("Detection thread started (target='%s')", target_class)
 
     if not mav.check_lidar_available(vehicle, timeout=3.0):
         raise RuntimeError("No LiDAR data — check PRX1_TYPE and proximity plugin")
@@ -58,12 +62,18 @@ def main() -> None:
     lidar.request_streams()
     time.sleep(0.5)
 
+    # Climb to the configured scan altitude before spinning/searching, so the
+    # whole scan runs at a fixed height (e.g. 5 m) instead of wherever the
+    # vehicle happened to be when handed over in GUIDED.
+    scan_alt = cfg.get("flight", {}).get("altitude", 5.0)
+    climb_to(vehicle, scan_alt)
+
     spin_dur   = lidar_cfg.get("spin_duration_s", 20.0)
     spin_speed = lidar_cfg.get("spin_speed_deg_s", 20.0)
     log.info("Starting 360° spin (%.0f °/s, %.0f s)", spin_speed, spin_dur)
     mav.rotate_right(vehicle, 360, speed_deg_s=spin_speed)
     room_profile = collect_spin_profile(vehicle, lidar, spin_duration=spin_dur,
-                                         person_found=person_found, spin_speed=spin_speed)
+                                         target_found=target_found, spin_speed=spin_speed)
     log.info("Spin complete — %d/360 angles with valid range data",
              int(sum(1 for v in room_profile if v != float("inf"))))
 
@@ -72,22 +82,28 @@ def main() -> None:
     # beams, stop at walls and turn toward the most-open direction. Camera
     # detects continuously while moving (see open_path_explore docstring).
     try:
-        if person_found.is_set():
+        if target_found.is_set():
             log.info("Person already detected during initial spin — skipping coverage search")
         else:
-            open_path_explore(vehicle, lidar, person_found, cfg)
+            open_path_explore(vehicle, lidar, target_found, cfg)
+
+        # ── Approach ───────────────────────────────────────────────────────
+        # Target seen — creep toward it, keeping the bbox bottom-centre at the
+        # frame centre, until the forward LiDAR is within stop_dist_m.
+        if target_found.is_set():
+            approach_target(vehicle, lidar, target_found, cfg)
     finally:
         lidar.close()
 
-    # ── LAND ───────────────────────────────────────────────────────────────
-    if person_found.is_set():
-        log.info("Person confirmed — LAND")
+    # ── BRAKE ───────────────────────────────────────────────────────────────
+    if target_found.is_set():
+        log.info("Person confirmed — BRAKE")
     else:
-        log.warning("Exploration ended without detection — LAND")
+        log.warning("Exploration ended without detection — BRAKE anyway")
     try:
-        mav.set_mode(vehicle, "LAND")
+        mav.set_mode(vehicle, "BRAKE")
     except Exception as exc:
-        log.warning("LAND mode set failed: %s", exc)
+        log.warning("BRAKE mode set failed: %s", exc)
     try:
         mav.close(vehicle)
     except Exception as exc:

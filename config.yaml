@@ -76,6 +76,25 @@ yolo:
   conf:       0.35           # minimum confidence threshold
   imgsz:      640            # inference input size (px)
 
+# Visual-servo approach: once the target class is detected, creep toward it
+# while keeping the bottom-centre of its bounding box at the frame centre, and
+# stop when the forward LiDAR is within stop_dist_m.
+approach:
+  target_class:     "person"   # YOLO class to detect and home in on
+  stop_dist_m:      3.0        # halt when the forward beam reads ≤ this (m)
+  speed_mps:        1.0        # gentle forward creep speed (m/s)
+  yaw_gain:         1.2        # err_x ∈ [-1,1] → yaw rate gain
+  max_yaw_deg_s:    45.0       # clamp on yaw slew rate (deg/s)
+  center_tol:       0.08       # |err_x| below this counts as centred
+  lost_grace_s:     3.0        # keep holding this long if the target drops out
+  time_budget_s:    60.0       # give up the approach after this long
+  # Descend while approaching — the 5 m survey altitude scans the forward LiDAR
+  # over a standing person's head (front beam stays inf), so drop to ~3 m AGL.
+  descend_alt_m:    3.0        # target altitude AGL to descend to during approach
+  descend_gain:     0.5        # altitude error (m) → vertical speed gain
+  descend_speed_mps: 0.7       # clamp on descent/climb rate (m/s)
+  alt_tol_m:        0.3        # |altitude error| below this counts as at-altitude
+
 exploration:
   # Replan distance for open_path_explore. Set ABOVE ArduPilot's OA distance
   # (OA_BR_LOOKAHEAD≈3 m, AVOID_MARGIN≈2 m) so our code turns toward an open

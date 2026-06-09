@@ -95,8 +95,17 @@ the proximity stream rate on the companion link:
 | `FENCE_ENABLE` | site-dependent | If a geofence is set, OA/AVOID react to it too — size it to the arena |
 
 The mission starts only once the vehicle is already in **GUIDED** and armed; it
-does not arm or take off on its own. On completion it commands **LAND**
-(`main.py`).
+does not arm or take off on its own. Once a person is detected it switches from
+search (`open_path_explore`) to **approach** (`approach_target`): a slow
+visual-servo creep that yaws to keep the bounding box centred and stops when the
+**front LiDAR reads ≤ `approach.stop_dist_m` (3 m)**. On completion it commands
+**BRAKE** (`main.py`; RTL skipped for now).
+
+> The approach uses body-frame velocity + yaw-rate setpoints
+> (`MAV_FRAME_BODY_NED`), so the same GUIDED speed caps apply — but it is
+> intentionally slow (`approach.speed_mps`, 1 m/s). The 3 m stop is checked
+> against the LiDAR forward beam, *below* the 5 m search replan distance, so the
+> drone is allowed to close right in on the person.
 
 ---
 

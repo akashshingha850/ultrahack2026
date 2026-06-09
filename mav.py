@@ -256,6 +256,34 @@ def _move_body_velocity(vehicle: mavutil.mavfile, vx: float, vy: float) -> None:
     log.debug("body velocity → vx=%.2f vy=%.2f m/s", vx, vy)
 
 
+def move_body_velocity_yaw(vehicle: mavutil.mavfile,
+                            vx: float, vy: float,
+                            yaw_rate_rad_s: float, vz: float = 0.0) -> None:
+    """Body-frame velocity setpoint with a simultaneous yaw rate.
+
+    vx = forward (m/s), vy = right (m/s), vz = DOWN (m/s, positive descends),
+    yaw_rate_rad_s = CW-positive yaw rate. Used by the visual-servo approach loop
+    to creep toward a target while yawing to keep it centred and descending to a
+    target altitude. Send (0, 0, 0) to stop and hold.
+    """
+    # Same mask as _move_body_velocity: ignore position/accel/force and the
+    # absolute-yaw field; velocity (vx/vy/vz) and yaw_rate are both honoured.
+    TYPE_MASK_VEL_YAWRATE = 0b0000_0111_1100_0111
+    vehicle.mav.set_position_target_local_ned_send(
+        0,
+        vehicle.target_system,
+        vehicle.target_component,
+        mavutil.mavlink.MAV_FRAME_BODY_NED,
+        TYPE_MASK_VEL_YAWRATE,
+        0, 0, 0,
+        vx, vy, vz,
+        0, 0, 0,
+        0, yaw_rate_rad_s,
+    )
+    log.debug("body vel+yaw → vx=%.2f vy=%.2f vz=%.2f m/s  yaw_rate=%.1f°/s",
+              vx, vy, vz, math.degrees(yaw_rate_rad_s))
+
+
 def _move_ned_distance(vehicle: mavutil.mavfile,
                         fwd: float, right: float,
                         timeout: int) -> None:

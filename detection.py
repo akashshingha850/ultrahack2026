@@ -25,13 +25,54 @@ _stream_cfg = _cfg["stream"]
 model = YOLO(_yolo_cfg["model"])
 
 
+# ---------------------------------------------------------------------------
+# Latest-target state — published by the detection thread, read by the
+# visual-servo approach loop (utils.approach_person). Holds the geometry the
+# guidance loop drives to zero: the bottom-centre of the target's bounding box
+# relative to the frame centre.
+# ---------------------------------------------------------------------------
+_latest_lock = threading.Lock()
+_latest_target: dict | None = None
+
+
+def get_latest_target(max_age: float = 0.5) -> dict | None:
+    """Return the most-recent target detection, or None if stale/absent.
+
+    The dict has:
+        {
+          "cx":        bottom-centre x of the box (px),
+          "by":        bottom edge y of the box (px),
+          "frame_w":   frame width (px),
+          "frame_h":   frame height (px),
+          "err_x":     horizontal error, (cx - frame_w/2) / (frame_w/2) ∈ [-1, 1]
+                       (negative = target left of centre, positive = right),
+          "conf":      detection confidence,
+          "t":         time.time() when captured,
+        }
+    *max_age* (s) guards against acting on a frame from before the target left
+    view — older than this returns None.
+    """
+    with _latest_lock:
+        tgt = _latest_target
+    if tgt is None:
+        return None
+    if time.time() - tgt["t"] > max_age:
+        return None
+    return tgt
+
+
 def watch_for(label: str, event: threading.Event) -> threading.Thread:
     """Start a background thread that sets *event* the moment *label* is detected.
 
-    Logs every detection (label + confidence) to both file and terminal.
+    Logs every detection (label + confidence) to both file and terminal, and
+    publishes the most-confident target's bounding-box geometry via
+    get_latest_target() so the approach loop can home in on it.
     Keeps retrying if the RTSP stream is unavailable.
     """
+    global _latest_target
+
     def _run() -> None:
+        global _latest_target
         while True:
             try:
                 log.info("Detection thread connecting to stream: %s", _stream_cfg["input"])
@@ -55,10 +96,31 @@ def watch_for(label: str, event: threading.Event) -> threading.Thread:
                     summary = ", ".join(f"{name} {conf:.2f}" for name, conf in detections)
                     log.info("Detected: %s", summary)
 
-                    # Signal if the target label is among them
-                    if any(name == label for name, _ in detections):
-                        best_conf = max(conf for name, conf in detections if name == label)
-                        log.info("TARGET '%s' FOUND — confidence %.2f", label, best_conf)
+                    # Publish the most-confident target box (if any) for the
+                    # approach loop, and signal the first time it's seen.
+                    best = None  # (conf, x1, y1, x2, y2)
+                    for c, conf, xyxy in zip(result.boxes.cls, result.boxes.conf,
+                                             result.boxes.xyxy):
+                        if model.names[int(c)] != label:
+                            continue
+                        x1, y1, x2, y2 = (float(v) for v in xyxy)
+                        if best is None or float(conf) > best[0]:
+                            best = (float(conf), x1, y1, x2, y2)
+
+                    if best is not None:
+                        conf, x1, y1, x2, y2 = best
+                        frame_h, frame_w = result.orig_shape  # (h, w)
+                        cx = (x1 + x2) / 2.0          # box centre x
+                        by = y2                        # box bottom edge
+                        err_x = (cx - frame_w / 2.0) / (frame_w / 2.0)
+                        with _latest_lock:
+                            _latest_target = {
+                                "cx": cx, "by": by,
+                                "frame_w": float(frame_w), "frame_h": float(frame_h),
+                                "err_x": err_x, "conf": conf, "t": time.time(),
+                            }
+                        if not event.is_set():
+                            log.info("TARGET '%s' FOUND — confidence %.2f", label, conf)
                         event.set()
 
             except Exception as exc:
