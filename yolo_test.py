@@ -24,7 +24,7 @@ with open("config.yaml") as f:
 
 _stream_cfg = _cfg["stream"]
 
-model = YOLO("fireman_yolo26s_taufiq_16.engine")
+model = YOLO("ultrahack2026.engine")
 
 if __name__ == "__main__":
     cap = cv2.VideoCapture(_stream_cfg["input"])

@@ -18,17 +18,16 @@ Make sure MediaMTX is up first:
 """
 
 import logging
-import shutil
-import subprocess
 import time
-from urllib.parse import urlparse, urlunparse
 
 import cv2
 import yaml
-from ultralytics import YOLO
-from ultralytics.utils import LOGGER as _yolo_logger
 
-_yolo_logger.setLevel(logging.WARNING)
+# guide provides detect()/visualize() with our frame-centre + bottom-centre-of-
+# smoke markers; publish handles the ffmpeg → MediaMTX pipe. Shared with the
+# live mission pipeline (detection.py) so this standalone tool stays in sync.
+import guide
+import publish
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,66 +40,15 @@ with open("config.yaml") as f:
 
 _yolo_cfg = _cfg["yolo"]
 _stream_cfg = _cfg["stream"]
-
-
-def _publish_url(url: str) -> str:
-    """Normalise the configured output URL into something ffmpeg can publish to.
-
-    The config uses a bind-style host (0.0.0.0) for documentation; ffmpeg needs
-    a real host to *connect* to when publishing, so rewrite it to localhost.
-    """
-    parsed = urlparse(url)
-    host = parsed.hostname or "localhost"
-    if host in ("0.0.0.0", "::", ""):
-        host = "127.0.0.1"
-    port = f":{parsed.port}" if parsed.port else ""
-    netloc = f"{host}{port}"
-    return urlunparse(parsed._replace(netloc=netloc))
-
-
-def _open_ffmpeg(out_url: str, width: int, height: int, fps: float) -> subprocess.Popen:
-    """Spawn ffmpeg reading raw BGR frames on stdin, publishing H.264 over RTSP."""
-    fps = fps if fps and fps > 0 else 25.0
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "warning",
-        "-y",
-        # --- raw input from our pipe ---
-        "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}",
-        "-r", f"{fps:.2f}",
-        "-i", "-",
-        # --- encode H.264 for low-latency streaming ---
-        # baseline profile + no B-frames keeps QGroundControl's GStreamer
-        # pipeline happy; short keyframe interval lets QGC sync quickly.
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
-        "-profile:v", "baseline",
-        "-pix_fmt", "yuv420p",
-        "-bf", "0",
-        "-g", f"{int(max(fps, 1))}",
-        "-f", "rtsp",
-        "-rtsp_transport", "tcp",
-        out_url,
-    ]
-    log.info("Starting ffmpeg publisher → %s (%dx%d @ %.1f fps)",
-             out_url, width, height, fps)
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+_target_class = _cfg.get("approach", {}).get("target_class", "smoke")
 
 
 def main() -> None:
-    if shutil.which("ffmpeg") is None:
+    if not publish.ffmpeg_available():
         raise SystemExit("ffmpeg not found on PATH — install it (apt install ffmpeg).")
 
     in_url = _stream_cfg["input"]
-    out_url = _publish_url(_stream_cfg["output"])
-
-    model = YOLO(_yolo_cfg["model"])
-    conf = _yolo_cfg["conf"]
-    imgsz = _yolo_cfg["imgsz"]
+    out_url = publish.publish_url(_stream_cfg["output"])
 
     ffmpeg = None
     prev = time.time()
@@ -125,13 +73,13 @@ def main() -> None:
                     log.warning("Input stream ended/dropped — reconnecting")
                     break
 
-                result = model(frame, conf=conf, imgsz=imgsz, verbose=False)[0]
-                annotated = result.plot()  # BGR frame with boxes + labels drawn
+                detections = guide.detect(frame, target=_target_class)
+                annotated = guide.visualize(frame, detections)  # frame-centre + bottom-centre markers
 
                 # Lazily start ffmpeg once we know the real annotated frame size.
                 if ffmpeg is None or ffmpeg.poll() is not None:
                     h, w = annotated.shape[:2]
-                    ffmpeg = _open_ffmpeg(out_url, w, h, src_fps)
+                    ffmpeg = publish.open_ffmpeg(out_url, w, h, src_fps)
 
                 try:
                     ffmpeg.stdin.write(annotated.tobytes())
@@ -143,9 +91,8 @@ def main() -> None:
                 now = time.time()
                 fps = 1.0 / max(now - prev, 1e-6)
                 prev = now
-                labels = [model.names[int(c)] for c in result.boxes.cls]
-                log.info("FPS: %.1f | %s", fps,
-                         ", ".join(labels) if labels else "no detections")
+                log.info("FPS: %.1f | %d %s", fps, len(detections),
+                         _target_class if detections else "no detections")
         finally:
             cap.release()
 

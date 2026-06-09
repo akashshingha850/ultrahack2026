@@ -4,10 +4,11 @@ guide.py — YOLO person detection for visual guidance.
 Loads the YOLO model, runs inference on the configured stream, and for each
 detection returns its (class, confidence, bounding box). Visualises them with:
   • a marker at the FRAME centre  (where the camera is pointing),
-  • a marker at each BOUNDING-BOX centre  (where the target is),
+  • a marker at each box's BOTTOM-CENTRE  (the guidance point we home in on),
   • the box itself + label/confidence,
-  • the offset vector frame-centre → box-centre — the pixel error a guidance
-    loop would drive to zero to centre the target.
+  • the offset vector frame-centre → bottom-centre — the pixel error (dx, dy) a
+    guidance loop drives to zero to lock the bbox bottom-centre on the frame
+    centre.
 
 Run directly to preview on the RTSP stream:  python3 guide.py
 """
@@ -23,10 +24,6 @@ from ultralytics.utils import LOGGER as _yolo_logger
 # Silence ultralytics' own logger so output goes through ours.
 _yolo_logger.setLevel(logging.WARNING)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
 log = logging.getLogger(__name__)
 
 with open("config.yaml") as f:
@@ -35,17 +32,25 @@ with open("config.yaml") as f:
 _yolo_cfg   = _cfg["yolo"]
 _stream_cfg = _cfg["stream"]
 
-# Loaded once at import — reused for every frame.
-model = YOLO(_yolo_cfg["model"])
+# Model is loaded lazily on first detect() so that importing this module purely
+# for visualize() (e.g. from detection.py) does NOT load a second YOLO engine.
+_model = None
+
+
+def _get_model() -> YOLO:
+    global _model
+    if _model is None:
+        _model = YOLO(_yolo_cfg["model"])
+    return _model
 
 
 # ---------------------------------------------------------------------------
 # Colours (BGR)
 # ---------------------------------------------------------------------------
-_FRAME_CENTRE = (0, 255, 255)   # yellow
-_BOX          = (0, 255, 0)     # green
-_BOX_CENTRE   = (0, 0, 255)     # red
-_VECTOR       = (255, 0, 0)     # blue
+_FRAME_CENTRE  = (0, 255, 255)   # yellow
+_BOX           = (0, 255, 0)     # green
+_BOTTOM_CENTRE = (255, 0, 255)   # magenta — bottom-centre of smoke (guidance point)
+_VECTOR        = (255, 0, 0)     # blue
 
 
 def detect(frame, target: str | None = None) -> list[dict]:
@@ -62,6 +67,7 @@ def detect(frame, target: str | None = None) -> list[dict]:
     If *target* is given (e.g. "person"), only detections of that class are
     returned; otherwise every detection is returned.
     """
+    model = _get_model()
     result = model(
         frame,
         conf=_yolo_cfg["conf"],
@@ -77,17 +83,19 @@ def detect(frame, target: str | None = None) -> list[dict]:
         x1, y1, x2, y2 = (float(v) for v in xyxy)
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         detections.append({
-            "label":  label,
-            "conf":   float(conf),
-            "box":    (x1, y1, x2, y2),
-            "center": (cx, cy),
+            "label":         label,
+            "conf":          float(conf),
+            "box":           (x1, y1, x2, y2),
+            "center":        (cx, cy),
+            "bottom_center": (cx, y2),   # guidance point: bottom-centre of the box
         })
     return detections
 
 
 def visualize(frame, detections: list[dict]):
-    """Annotate *frame* in place: frame-centre marker, each box + box-centre
-    marker, and the offset vector between them. Returns the frame."""
+    """Annotate *frame* in place: a marker at the frame centre, a marker at the
+    BOTTOM-CENTRE of each box, and the offset vector between them (the pixel
+    guidance error the approach loop drives to zero). Returns the frame."""
     h, w = frame.shape[:2]
     fcx, fcy = w // 2, h // 2
 
@@ -97,7 +105,7 @@ def visualize(frame, detections: list[dict]):
 
     for d in detections:
         x1, y1, x2, y2 = (int(v) for v in d["box"])
-        cx, cy = int(round(d["center"][0])), int(round(d["center"][1]))
+        bcx, bcy = int(round(d["bottom_center"][0])), int(round(d["bottom_center"][1]))
 
         # Bounding box + label.
         cv2.rectangle(frame, (x1, y1), (x2, y2), _BOX, 2)
@@ -105,19 +113,24 @@ def visualize(frame, detections: list[dict]):
                     (x1, max(14, y1 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, _BOX, 2)
 
-        # Box centre marker (where the target is).
-        cv2.drawMarker(frame, (cx, cy), _BOX_CENTRE, cv2.MARKER_TILTED_CROSS, 18, 2)
+        # Bottom-centre marker (the point we align on).
+        cv2.drawMarker(frame, (bcx, bcy), _BOTTOM_CENTRE, cv2.MARKER_TILTED_CROSS, 20, 2)
+        cv2.circle(frame, (bcx, bcy), 6, _BOTTOM_CENTRE, 1)
 
-        # Offset vector: frame centre → box centre (pixel guidance error).
-        cv2.line(frame, (fcx, fcy), (cx, cy), _VECTOR, 2)
-        dx, dy = cx - fcx, cy - fcy
-        cv2.putText(frame, f"dx={dx:+d} dy={dy:+d}", (cx + 10, cy),
+        # Offset vector: frame centre → bottom-centre (pixel guidance error).
+        cv2.line(frame, (fcx, fcy), (bcx, bcy), _VECTOR, 2)
+        dx, dy = bcx - fcx, bcy - fcy
+        cv2.putText(frame, f"dx={dx:+d} dy={dy:+d}", (bcx + 10, bcy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, _VECTOR, 1)
 
     return frame
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
     cap = cv2.VideoCapture(_stream_cfg["input"])
     if not cap.isOpened():
         log.error("Could not open stream: %s", _stream_cfg["input"])

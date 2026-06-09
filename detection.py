@@ -1,5 +1,15 @@
 """
-YOLO person detection — runs as a persistent background thread.
+YOLO target detection + annotated re-stream — one seamless pipeline.
+
+A single background thread reads the camera RTSP feed, runs YOLO once per frame,
+and from that single inference both:
+  • drives guidance — publishes the target's bounding-box geometry (used by the
+    visual-servo approach) and sets the target-found event, and
+  • publishes the annotated feed (frame-centre + bottom-centre-of-target markers,
+    via guide.visualize) to MediaMTX over RTSP so it can be watched live.
+
+This replaces running detection.py and stream.py as two separate processes, each
+with its own YOLO engine competing for the same stream.
 """
 
 import logging
@@ -10,6 +20,9 @@ import yaml
 
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER as _yolo_logger
+
+import guide      # visualize() only — its model is lazy, so no second engine loads
+import publish
 
 # Silence ultralytics' own logger so all output goes through ours
 _yolo_logger.setLevel(logging.WARNING)
@@ -46,6 +59,13 @@ def get_latest_target(max_age: float = 0.5) -> dict | None:
           "frame_h":   frame height (px),
           "err_x":     horizontal error, (cx - frame_w/2) / (frame_w/2) ∈ [-1, 1]
                        (negative = target left of centre, positive = right),
+          "err_y":     vertical error of the bottom-centre, (by - frame_h/2) /
+                       (frame_h/2) ∈ [-1, 1] (negative = above centre, positive =
+                       below) — drive to zero to keep the bbox bottom-centre on
+                       the frame centre,
+          "area_frac": bbox area / frame area ∈ [0, 1] — how much of the frame
+                       the target fills; the approach uses this to decide it is
+                       "close enough" (smoke gives no LiDAR echo to range off),
           "conf":      detection confidence,
           "t":         time.time() when captured,
         }
@@ -62,20 +82,27 @@ def get_latest_target(max_age: float = 0.5) -> dict | None:
 
 
 def watch_for(label: str, event: threading.Event) -> threading.Thread:
-    """Start a background thread that sets *event* the moment *label* is detected.
+    """Start the detection+stream thread: sets *event* the moment *label* is seen.
 
-    Logs every detection (label + confidence) to both file and terminal, and
-    publishes the most-confident target's bounding-box geometry via
-    get_latest_target() so the approach loop can home in on it.
-    Keeps retrying if the RTSP stream is unavailable.
+    From a single YOLO inference per frame it (a) publishes the most-confident
+    target's bbox geometry via get_latest_target() for the approach loop, (b)
+    logs detections, and (c) re-publishes the annotated feed (frame-centre +
+    bottom-centre-of-target markers) to MediaMTX. Keeps retrying if the stream
+    is unavailable.
     """
     global _latest_target
 
+    out_url = publish.publish_url(_stream_cfg["output"]) if publish.ffmpeg_available() else None
+    if out_url is None:
+        log.warning("ffmpeg not found on PATH — annotated stream will NOT be published "
+                    "(detection/guidance still runs)")
+
     def _run() -> None:
         global _latest_target
+        ffmpeg = None
         while True:
             try:
-                log.info("Detection thread connecting to stream: %s", _stream_cfg["input"])
+                log.info("Detection+stream pipeline connecting to stream: %s", _stream_cfg["input"])
                 for result in model(
                     _stream_cfg["input"],
                     stream=True,
@@ -84,40 +111,59 @@ def watch_for(label: str, event: threading.Event) -> threading.Thread:
                     show=False,
                     verbose=False,
                 ):
-                    if not result.boxes:
-                        continue
+                    frame = result.orig_img
+                    frame_h, frame_w = result.orig_shape  # (h, w)
 
-                    detections = [
-                        (model.names[int(c)], float(conf))
-                        for c, conf in zip(result.boxes.cls, result.boxes.conf)
-                    ]
-
-                    # Log every frame that has any detection
-                    summary = ", ".join(f"{name} {conf:.2f}" for name, conf in detections)
-                    log.info("Detected: %s", summary)
-
-                    # Publish the most-confident target box (if any) for the
-                    # approach loop, and signal the first time it's seen.
+                    # Build target-class detections in guide's dict format — used
+                    # both for the overlay and to pick the best box for guidance.
+                    dets: list[dict] = []
                     best = None  # (conf, x1, y1, x2, y2)
                     for c, conf, xyxy in zip(result.boxes.cls, result.boxes.conf,
                                              result.boxes.xyxy):
                         if model.names[int(c)] != label:
                             continue
                         x1, y1, x2, y2 = (float(v) for v in xyxy)
+                        bcx = (x1 + x2) / 2.0
+                        dets.append({
+                            "label": label, "conf": float(conf),
+                            "box": (x1, y1, x2, y2),
+                            "center": (bcx, (y1 + y2) / 2.0),
+                            "bottom_center": (bcx, y2),
+                        })
                         if best is None or float(conf) > best[0]:
                             best = (float(conf), x1, y1, x2, y2)
 
+                    # ── Publish the annotated frame (EVERY frame → continuous) ──
+                    if out_url is not None and frame is not None:
+                        try:
+                            annotated = guide.visualize(frame.copy(), dets)
+                            if ffmpeg is None or ffmpeg.poll() is not None:
+                                h, w = annotated.shape[:2]
+                                ffmpeg = publish.open_ffmpeg(out_url, w, h, 0)
+                            ffmpeg.stdin.write(annotated.tobytes())
+                        except (BrokenPipeError, ValueError):
+                            log.warning("ffmpeg pipe broke — restarting publisher")
+                            ffmpeg = None
+                        except Exception as exc:
+                            log.debug("Annotated-stream publish error: %s", exc)
+
+                    # ── Drive guidance from the best target box ──
                     if best is not None:
                         conf, x1, y1, x2, y2 = best
-                        frame_h, frame_w = result.orig_shape  # (h, w)
-                        cx = (x1 + x2) / 2.0          # box centre x
+                        log.info("Detected: %s %.2f", label, conf)
+                        cx = (x1 + x2) / 2.0          # bottom-centre x (= box centre x)
                         by = y2                        # box bottom edge
                         err_x = (cx - frame_w / 2.0) / (frame_w / 2.0)
+                        err_y = (by - frame_h / 2.0) / (frame_h / 2.0)
+                        area_frac = (max(0.0, x2 - x1) * max(0.0, y2 - y1)) / \
+                                    max(1.0, frame_w * frame_h)
                         with _latest_lock:
                             _latest_target = {
                                 "cx": cx, "by": by,
                                 "frame_w": float(frame_w), "frame_h": float(frame_h),
-                                "err_x": err_x, "conf": conf, "t": time.time(),
+                                "err_x": err_x, "err_y": err_y,
+                                "area_frac": area_frac,
+                                "conf": conf, "t": time.time(),
                             }
                         if not event.is_set():
                             log.info("TARGET '%s' FOUND — confidence %.2f", label, conf)

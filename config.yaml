@@ -15,6 +15,10 @@ flight:
   speed: 5.0                # m/s groundspeed during coverage
   takeoff_altitude: 5.0    # metres AGL to climb before starting
   rtl_altitude: 5.0        # metres AGL for RTL
+  # When the approach loses the target and relocates, roam this much higher on
+  # each retry (capped) for a better view — addresses "not high enough to see it".
+  search_climb_step_m:     2.0    # extra altitude added per relocate attempt (m)
+  max_search_altitude_m:   11.0   # cap on the relocate search altitude (m AGL)
 
 coverage:
   # Radius = FENCE_RADIUS − FENCE_MARGIN (both read from the vehicle).
@@ -73,27 +77,58 @@ stream:
 
 yolo:
   model:      "ultrahack2026.engine"   # model weights file (downloaded automatically if missing)
-  conf:       0.5           # minimum confidence threshold
+  conf:       0.25           # minimum confidence threshold
   imgsz:      640            # inference input size (px)
 
 # Visual-servo approach: once the target class is detected, creep toward it
-# while keeping the bottom-centre of its bounding box at the frame centre, and
-# stop when the forward LiDAR is within stop_dist_m.
+# while keeping the bottom-centre of its bounding box on the frame centre (yaw
+# for horizontal, climb/descend for vertical — the gimbal is never moved), and
+# stop when the bbox fills stop_bbox_frac of the frame. Vision only.
 approach:
-  target_class:     "smoke"   # YOLO class to detect and home in on
-  stop_dist_m:      3.0        # halt when the forward beam reads ≤ this (m)
+  target_class:     "human"   # YOLO class to detect and home in on
+  # Stop once the bbox fills this fraction of the frame (triggers the orbital
+  # scan). If never reached but the target stays in view, the approach still
+  # proceeds to the orbit when time_budget_s elapses. Logs "bbox=NN%" each cycle.
+  stop_bbox_frac:   0.15       # stop when bbox area ≥ this fraction of the frame
+  lidar_stop_m:     4.0        # also stop when a detection coincides with a LiDAR obstacle this close ahead (m)
   speed_mps:        1.0        # gentle forward creep speed (m/s)
+  # Horizontal alignment: yaw the nose onto the target.
   yaw_gain:         1.2        # err_x ∈ [-1,1] → yaw rate gain
   max_yaw_deg_s:    45.0       # clamp on yaw slew rate (deg/s)
   center_tol:       0.08       # |err_x| below this counts as centred
-  lost_grace_s:     3.0        # keep holding this long if the target drops out
+  # Vertical alignment: climb/descend to put the bbox bottom-centre on the frame
+  # centre (err_y>0 = target low in frame ⇒ descend). Gimbal angle is unchanged.
+  vert_align_gain:  0.6        # err_y ∈ [-1,1] → vertical speed gain (m/s per unit)
+  descend_speed_mps: 0.7       # clamp on climb/descent rate (m/s)
+  center_tol_y:     0.08       # |err_y| below this counts as vertically centred
+  # Re-acquire: a full 360° spin can end facing away from a target seen mid-spin.
+  # First yaw to the bearing where it was best seen, then wait to re-detect it.
+  reacquire_yaw_deg_s: 45.0    # slew rate when re-aiming to the target bearing (deg/s)
+  reacquire_timeout_s: 8.0     # how long to wait for re-detection after re-aiming (s)
+  # Flaky detection: smoke is far/low-confidence so YOLO flickers. Treat a
+  # detection up to detection_max_age_s old as valid; hover through dropouts up
+  # to lost_grace_s, then hand back so the mission relocates to new waypoints.
+  detection_max_age_s: 1.0     # a detection this old still drives guidance
+  lost_grace_s:     4.0        # hover this long through a dropout before relocating
+  relocate_retries:  4         # max relocate-and-retry attempts before giving up
   time_budget_s:    60.0       # give up the approach after this long
-  # Descend while approaching — the 5 m survey altitude scans the forward LiDAR
-  # over a standing person's head (front beam stays inf), so drop to ~3 m AGL.
-  descend_alt_m:    3.0        # target altitude AGL to descend to during approach
-  descend_gain:     0.5        # altitude error (m) → vertical speed gain
-  descend_speed_mps: 0.7       # clamp on descent/climb rate (m/s)
-  alt_tol_m:        0.3        # |altitude error| below this counts as at-altitude
+
+# Orbital scan: after the approach stops at the target, DESCEND to altitude_m
+# (e.g. 3 m) and fly a circle around the target ("the block") with the nose
+# pointed inward so the camera captures it from every side. LiDAR-safe: any leg
+# whose travel direction is blocked within safe_clear_m is skipped.
+orbit:
+  radius_m:        6.0    # orbit radius around the target (m)
+  target_distance_m: 6.0  # assumed distance to the target straight ahead (vision only, no LiDAR)
+  altitude_m:      3.0    # AGL to descend to before orbiting (null = hold current altitude)
+  safe_clear_m:    2.5    # skip an orbit leg if LiDAR clearance toward it is below this (m)
+  step_deg:        15.0   # angular spacing between orbit waypoints (deg)
+  revolutions:     1.0    # how many full loops to fly
+  speed_mps:       1.5    # groundspeed around the orbit (m/s)
+  settle_s:        1.5    # pause at each orbit waypoint for a clean frame (s)
+  direction:       1      # 1 = clockwise, -1 = counter-clockwise
+  accept_rad_m:    1.5    # "reached orbit waypoint" radius (m)
+  wp_timeout_s:    20     # per-waypoint timeout (s)
 
 exploration:
   # Replan distance for open_path_explore. Set ABOVE ArduPilot's OA distance
@@ -114,8 +149,9 @@ exploration:
 lidar:
   obstacle_distance_rate_hz: 10
   stream_timeout_s: 2.0
-  spin_duration_s: 8.0     # 360° / 45 deg/s = 8 s; trims ~4 s of stationary time per stop
-  spin_speed_deg_s: 45.0   # also cancellable mid-spin the instant a person is detected
+  spin_duration_s: 8.0     # floor only; the spin now runs until a tracked full 360°
+  spin_max_duration_s: 45.0  # safety cap — stop spinning after this even if 360° not measured
+  spin_speed_deg_s: 45.0   # commanded yaw rate (vehicle often yaws slower than this)
   min_valid_range_m: 0.2
   max_valid_range_m: 12.0
 

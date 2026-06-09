@@ -21,7 +21,7 @@ import detection
 import lidar as lidar_module
 from utils import (
     setup_logging, wait_for_guided, climb_to, collect_spin_profile,
-    open_path_explore, approach_target,
+    open_path_explore, approach_target, orbital_scan,
 )
 
 log = logging.getLogger("main")
@@ -44,9 +44,15 @@ def main() -> None:
 
     # ── Detection starts immediately — runs for the entire mission ────────
     target_class = cfg.get("approach", {}).get("target_class", "person")
+    # The detection thread is a single pipeline: it runs YOLO once per frame to
+    # drive guidance AND re-publishes the annotated feed (frame-centre +
+    # bottom-centre-of-target markers) to MediaMTX — both live from the start.
+    # View it live (e.g. VLC → the output URL); MediaMTX must be up first:
+    #   cd mediamtx && docker compose up -d
     target_found = threading.Event()
     detection.watch_for(target_class, target_found)
-    log.info("Detection thread started (target='%s')", target_class)
+    log.info("Detection+stream pipeline started (target='%s') — annotated feed → %s",
+             target_class, cfg["stream"]["output"])
 
     if not mav.check_lidar_available(vehicle, timeout=3.0):
         raise RuntimeError("No LiDAR data — check PRX1_TYPE and proximity plugin")
@@ -54,9 +60,11 @@ def main() -> None:
     wait_for_guided(vehicle)
 
     # ── Initial spin ──────────────────────────────────────────────────────
-    # One quick 360° at the start position: cheap insurance for a person who is
+    # A 360° at the start position: cheap insurance for a target that is
     # beside/behind the drone at launch, and a chance to detect before we move.
-    # Cancels itself early the instant the camera sees the target.
+    # Completes a tracked full turn UNLESS the target is spotted partway round —
+    # then it stops and heads straight to the target (skipping the rest of the
+    # spin and the coverage search).
     lidar_cfg = cfg.get("lidar", {})
     lidar = lidar_module.LidarReader(vehicle)
     lidar.request_streams()
@@ -70,36 +78,74 @@ def main() -> None:
 
     spin_dur   = lidar_cfg.get("spin_duration_s", 20.0)
     spin_speed = lidar_cfg.get("spin_speed_deg_s", 20.0)
-    log.info("Starting 360° spin (%.0f °/s, %.0f s)", spin_speed, spin_dur)
+    spin_max   = lidar_cfg.get("spin_max_duration_s", 45.0)
+    log.info("Starting 360° spin (%.0f °/s commanded) — full turn unless the target "
+             "is seen first (safety cap %.0f s)", spin_speed, spin_max)
     mav.rotate_right(vehicle, 360, speed_deg_s=spin_speed)
-    room_profile = collect_spin_profile(vehicle, lidar, spin_duration=spin_dur,
-                                         target_found=target_found, spin_speed=spin_speed)
+    hfov = cfg.get("camera", {}).get("hfov_deg", 82.6)
+    room_profile, target_bearing = collect_spin_profile(
+        vehicle, lidar, spin_duration=spin_dur, target_found=target_found,
+        spin_speed=spin_speed, max_duration=spin_max, camera_hfov_deg=hfov)
     log.info("Spin complete — %d/360 angles with valid range data",
              int(sum(1 for v in room_profile if v != float("inf"))))
 
-    # ── Coverage search ───────────────────────────────────────────────────
-    # Reactive open-path explorer: cruise through open space using all 8 LiDAR
-    # beams, stop at walls and turn toward the most-open direction. Camera
-    # detects continuously while moving (see open_path_explore docstring).
-    try:
-        if target_found.is_set():
-            log.info("Person already detected during initial spin — skipping coverage search")
-        else:
-            open_path_explore(vehicle, lidar, target_found, cfg)
+    # ── Search → approach → relocate loop ────────────────────────────────────
+    # Reactive open-path explorer finds the target (camera detects while moving);
+    # the approach creeps in and stops when the bbox is big enough, then orbits.
+    # If the approach loses the target and a quick yaw search can't recover it,
+    # we RELOCATE — roam to new waypoints, a little higher each retry for a better
+    # view — and try again, instead of spinning fruitlessly in one spot.
+    flight_cfg  = cfg.get("flight", {})
+    scan_alt    = flight_cfg.get("altitude", 5.0)
+    alt_step    = flight_cfg.get("search_climb_step_m", 2.0)
+    max_alt     = flight_cfg.get("max_search_altitude_m", scan_alt + 6.0)
+    max_retries = cfg.get("approach", {}).get("relocate_retries", 4)
 
-        # ── Approach ───────────────────────────────────────────────────────
-        # Target seen — creep toward it, keeping the bbox bottom-centre at the
-        # frame centre, until the forward LiDAR is within stop_dist_m.
-        if target_found.is_set():
-            approach_target(vehicle, lidar, target_found, cfg)
+    reached = False
+    bearing = target_bearing      # re-aim hint, only valid straight from the spin
+    attempt = 0
+    try:
+        while True:
+            # Find (or re-find) the target by roaming, unless we already see it.
+            if not target_found.is_set():
+                search_alt = min(scan_alt + attempt * alt_step, max_alt)
+                if attempt == 0:
+                    log.info("Coverage search — roaming to find the target")
+                else:
+                    log.info("Relocating to re-find the target — explore at %.1f m "
+                             "(attempt %d/%d)", search_alt, attempt, max_retries)
+                open_path_explore(vehicle, lidar, target_found, cfg, altitude=search_alt)
+                bearing = None
+            else:
+                log.info("Target already detected during the spin — skipping coverage search")
+
+            if not target_found.is_set():
+                log.warning("Exploration exhausted — no target found")
+                break
+
+            # Creep toward the target, centring the bbox; stop when it fills the
+            # frame, then orbit. Returns False if the target was lost and a quick
+            # yaw search couldn't recover it → relocate and retry.
+            reached = approach_target(vehicle, lidar, target_found, cfg,
+                                      reacquire_bearing_deg=bearing)
+            if reached:
+                orbital_scan(vehicle, lidar, target_found, cfg)
+                break
+
+            attempt += 1
+            if attempt > max_retries:
+                log.warning("Target lost and not re-found after %d relocate attempts — giving up",
+                            max_retries)
+                break
+            target_found.clear()      # force a fresh re-detection from the new vantage
     finally:
         lidar.close()
 
     # ── BRAKE ───────────────────────────────────────────────────────────────
-    if target_found.is_set():
-        log.info("Person confirmed — BRAKE")
+    if reached:
+        log.info("Target reached and scanned — BRAKE")
     else:
-        log.warning("Exploration ended without detection — BRAKE anyway")
+        log.warning("Mission ended without reaching the target — BRAKE anyway")
     try:
         mav.set_mode(vehicle, "BRAKE")
     except Exception as exc:
