@@ -44,17 +44,16 @@ def setup_logging(cfg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def wait_for_guided(vehicle) -> None:
-    """Block until the vehicle is BOTH in GUIDED mode AND armed — the mission
-    go-signal. The pilot arms and selects GUIDED; the code only checks, it never
-    arms the motors itself."""
+    """Block until the vehicle is in GUIDED mode — the mission go-signal. The
+    pilot selects GUIDED; the code only checks, it never arms the motors itself.
+    Arm state is intentionally ignored: GUIDED alone starts the mission."""
     import mav
     while True:
-        mode  = mav.get_mode(vehicle)
-        armed = mav._is_armed(vehicle)
-        if mode == "GUIDED" and armed:
-            log.info("GUIDED + armed confirmed — mission go")
+        mode = mav.get_mode(vehicle)
+        if mode == "GUIDED":
+            log.info("GUIDED confirmed — mission go")
             return
-        log.info("Waiting for GUIDED + armed (mode=%s, armed=%s)…", mode, armed)
+        log.info("Waiting for GUIDED (mode=%s)…", mode)
 
 
 def climb_to(vehicle, altitude: float, tol: float = 0.4, timeout: float = 25.0,

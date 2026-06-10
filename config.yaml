@@ -5,10 +5,10 @@ connection:
   # Serial: /dev/ttyUSB0 (baud rate applies)
   # UDP:    udp:127.0.0.1:14550
   # TCP:    tcp:127.0.0.1:5760
-  string: "udpin:0.0.0.0:14500"
-  # string: "/dev/ttyTHS1"
-  baud: 57600
-  # baud: 115200
+  # string: "udpin:0.0.0.0:14500"
+  string: "/dev/ttyTHS1"
+  # baud: 57600
+  baud: 115200
   source_system: 255
   timeout: 60               # seconds to wait for heartbeat
 
@@ -39,17 +39,17 @@ coverage:
 # Camera: SIYI A8 Mini at 1× zoom.
 # Ring spacing is auto-computed as  min(swath_w, swath_h) × (1 – overlap).
 camera:
-  hfov_deg: 82.6          # horizontal FOV at 1× zoom
+  hfov_deg: 82.6          # horizontal FOV at 1× zoomt each waypoint (0 = pass-through)
+  timeout: 300              # seconds to wait for each waypoint before aborting
+
+# Survey-grid mission: fly to a handful of stops and spin 360° at each so the
+# camera (10-12 m detection range) covers the
   vfov_deg: 52.3          # vertical FOV (4K 16:9, derived from HFOV)
   overlap:   0.10         # 10 % side overlap – enough for surveillance
 
 waypoint:
   acceptance_radius: 2.0    # metres – considered "reached" (NED 2-D distance)
-  loiter_time: 0            # seconds to loiter at each waypoint (0 = pass-through)
-  timeout: 300              # seconds to wait for each waypoint before aborting
-
-# Survey-grid mission: fly to a handful of stops and spin 360° at each so the
-# camera (10-12 m detection range) covers the whole arena between them.
+  loiter_time: 0            # seconds to loiter a whole arena between them.
 # Start position is random (mission.md), so the grid is laid out *relative to
 # the start* and assumed centred in the arena — edge_margin_m shrinks the grid
 # so off-centre starts are less likely to push a stop through a wall.
@@ -78,8 +78,8 @@ nbv:
   revisit_radius_m:  5.0    # metres – radius considered "already visited"
 
 stream:
-  # input:  "rtsp://192.168.144.25:8554/main.264"
-  input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
+  input:  "rtsp://192.168.144.25:8554/main.264"
+  # input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
   output: "rtsp://0.0.0.0:8555/live"
   record_dir: "recordings"   # annotated output feed is also saved here as <timestamp>.mp4 ("" = off)
 
@@ -93,7 +93,7 @@ targets:
 
 yolo:
   model:      "ultrahack2026.engine"   # model weights file (downloaded automatically if missing)
-  conf:       0.25           # minimum confidence threshold
+  conf:       0.15           # minimum confidence threshold
   imgsz:      640            # inference input size (px)
 
 # Visual-servo approach: once the target class is detected, creep toward it
