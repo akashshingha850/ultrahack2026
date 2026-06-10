@@ -60,10 +60,14 @@ Tuning lives in [config.yaml](config.yaml); ArduPilot params in [param.md](param
   climb/descend; gimbal never moves).
 - **Stop** at bbox ≥ `stop_bbox_frac` **or** when the forward LiDAR obstacle is
   within `lidar_stop_m` (~3 m).
-- Hovers through detection dropouts up to `lost_grace_s`; if the target stays
-  lost it returns False → relocate.
+- **Lost-target recovery:** hovers through brief dropouts up to `lost_grace_s`;
+  if the smoke stays lost, it flies **back to the last vantage where it was
+  solidly seen** (fixed yaw, gimbal fixed) and trims altitude by the bbox
+  vertical position to re-frame it, retrying up to `reacquire_attempts` times
+  before handing back to relocate. (It does **not** roam blindly away from a
+  known-good viewpoint.)
 
-### 6. Relocate-and-retry (if lost)
+### 6. Relocate-and-retry (if recovery fails)
 - Re-run `open_path_explore` a little higher each attempt
   (`search_climb_step_m`, capped at `max_search_altitude_m`), up to
   `approach.relocate_retries`.
@@ -77,4 +81,6 @@ Tuning lives in [config.yaml](config.yaml); ArduPilot params in [param.md](param
 ### 8. Return — RTL
 - Switch to **RTL** so the flight controller flies home (EKF origin / launch
   point) and lands. On failure to reach the target, fall back to **BRAKE**.
-- Finally, stop the SIYI recording and disconnect the camera.
+- Keep the **SIYI recording rolling until the vehicle disarms** (RTL disarms on
+  landing; on the BRAKE fallback the pilot lands/disarms manually), then stop the
+  recording and disconnect the camera.

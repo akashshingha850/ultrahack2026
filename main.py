@@ -170,8 +170,12 @@ def main() -> None:
         log.warning("Mission ended without reaching the target — BRAKE")
         _safe_mode(vehicle, "BRAKE")
 
-    # ── Stop recording ────────────────────────────────────────────────────────
+    # ── Stop recording AFTER the vehicle disarms ──────────────────────────────
+    # RTL lands and disarms on its own; on the BRAKE fallback the pilot lands and
+    # disarms manually. Either way, keep the SIYI recording rolling until disarm
+    # so the whole flight is captured, then stop and disconnect the camera.
     if camera is not None:
+        _wait_disarm(vehicle, timeout=180.0)
         try:
             siyi.stop_recording(camera)
         except Exception as exc:
@@ -185,6 +189,21 @@ def _safe_mode(vehicle, mode: str) -> None:
         mav.set_mode(vehicle, mode)
     except Exception as exc:
         log.warning("%s mode set failed: %s", mode, exc)
+
+
+def _wait_disarm(vehicle, timeout: float) -> None:
+    """Block until the vehicle disarms, or *timeout* s elapse."""
+    log.info("Waiting for disarm before stopping the recording (timeout %.0f s)…", timeout)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if not mav._is_armed(vehicle):
+                log.info("Disarmed — stopping recording")
+                return
+        except Exception:
+            pass
+        time.sleep(1.0)
+    log.warning("Disarm not seen within %.0f s — stopping recording anyway", timeout)
 
 
 if __name__ == "__main__":

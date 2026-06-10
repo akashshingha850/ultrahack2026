@@ -5,10 +5,10 @@ connection:
   # Serial: /dev/ttyUSB0 (baud rate applies)
   # UDP:    udp:127.0.0.1:14550
   # TCP:    tcp:127.0.0.1:5760
-  # string: "udpin:0.0.0.0:14500"
-  string: "/dev/ttyTHS1"
-  # baud: 57600
-  baud: 115200
+  string: "udpin:0.0.0.0:14500"
+  # string: "/dev/ttyTHS1"
+  baud: 57600
+  # baud: 115200
   source_system: 255
   timeout: 60               # seconds to wait for heartbeat
 
@@ -73,8 +73,8 @@ nbv:
   revisit_radius_m:  5.0    # metres – radius considered "already visited"
 
 stream:
-  input:  "rtsp://192.168.144.25:8554/main.264"
-  # input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
+  # input:  "rtsp://192.168.144.25:8554/main.264"
+  input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
   output: "rtsp://0.0.0.0:8555/live"
   record_dir: "recordings"   # annotated output feed is also saved here as <timestamp>.mp4 ("" = off)
 
@@ -116,6 +116,11 @@ approach:
   # First yaw to the bearing where it was best seen, then wait to re-detect it.
   reacquire_yaw_deg_s: 45.0    # slew rate when re-aiming to the target bearing (deg/s)
   reacquire_timeout_s: 8.0     # how long to wait for re-detection after re-aiming (s)
+  # Lost-target recovery: fly BACK to the last vantage where the smoke was seen
+  # (fixed yaw) and trim altitude by the bbox vertical position to re-frame it,
+  # instead of roaming away. Retries a few times before handing back to relocate.
+  reacquire_return_timeout_s: 20.0   # time to re-acquire at the old vantage (s)
+  reacquire_attempts:         2      # return-to-vantage recoveries before relocating
   # Flaky detection: smoke is far/low-confidence so YOLO flickers. Treat a
   # detection up to detection_max_age_s old as valid; hover through dropouts up
   # to lost_grace_s, then hand back so the mission relocates to new waypoints.

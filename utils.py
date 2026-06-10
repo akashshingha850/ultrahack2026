@@ -400,8 +400,13 @@ def approach_target(vehicle, lidar, target_found: threading.Event, cfg: dict,
     *reacquire_bearing_deg*: if the spin ended facing away from a target seen
     mid-spin, yaw to that bearing once and wait briefly to re-acquire first.
 
+    If the target is lost past lost_grace_s, recovery first flies BACK to the last
+    vantage where it was solidly seen (fixed yaw, gimbal fixed) and trims altitude
+    by the bbox vertical position to re-frame it, retrying a few times before
+    handing back to the caller to relocate.
+
     Returns True if it stopped close enough (or the budget elapsed with the
-    target still in view), False if the target stayed lost past lost_grace_s.
+    target still in view), False if the target stayed lost and recovery failed.
     """
     import detection
     import mav
@@ -435,6 +440,12 @@ def approach_target(vehicle, lidar, target_found: threading.Event, cfg: dict,
         while time.time() < reacq_deadline and detection.get_latest_target(max_age=max_age) is None:
             time.sleep(0.2)
 
+    flight_cfg = cfg.get("flight", {})
+    alt_min    = 1.5
+    alt_max    = flight_cfg.get("max_search_altitude_m", 11.0)
+    ret_to     = ap.get("reacquire_return_timeout_s", 20.0)   # time to re-acquire at the old vantage
+    max_recov  = ap.get("reacquire_attempts", 2)              # return-to-vantage tries before relocating
+
     def _fwd_clear():
         """Forward (body 0°) LiDAR clearance in metres; inf if no reading."""
         try:
@@ -442,20 +453,69 @@ def approach_target(vehicle, lidar, target_found: threading.Event, cfg: dict,
         except TimeoutError:
             return float("inf")
 
+    def _return_and_reacquire(pose) -> bool:
+        """Recovery on a lost target: fly BACK to the last vantage where the smoke
+        was seen, holding that yaw (gimbal fixed), and trim altitude by the bbox
+        vertical position — target low in frame ⇒ descend, high ⇒ ascend — to
+        re-frame it. Returns True once the detection is back and stable, False if
+        it stays lost. This keeps us at a known-good viewpoint instead of roaming
+        blindly away from it."""
+        n, e, hold_down, yaw = pose
+        log.info("Approach — lost; returning to last-good vantage N=%.1f E=%.1f alt=%.1f m "
+                 "yaw=%.0f° to re-acquire", n, e, -hold_down, math.degrees(yaw) % 360)
+        rdeadline = time.time() + ret_to
+        seen = 0
+        while time.time() < rdeadline:
+            if target_found.is_set():
+                tgt = detection.get_latest_target(max_age=max_age)
+            else:
+                tgt = None
+            if tgt is not None:
+                seen += 1
+                err_y = tgt.get("err_y", 0.0)
+                if abs(err_y) > center_tol_y:        # ascend/descend to confirm a better view
+                    vz = max(-max_vz, min(max_vz, kp_vz * err_y))
+                    hold_down = -min(alt_max, max(alt_min, -(hold_down + vz * 0.2)))
+                if seen >= 2:                         # detection is back and stable
+                    log.info("Approach — re-acquired at the vantage (err_y=%+.2f) — resuming", err_y)
+                    return True
+            else:
+                seen = 0
+            mav.goto_ned(vehicle, n, e, hold_down, speed=creep_speed, yaw_rad=yaw)
+            time.sleep(0.2)
+        log.warning("Approach — could not re-acquire at the vantage within %.0f s", ret_to)
+        return False
+
     deadline  = time.time() + time_budget
     last_seen = time.time()
+    last_good = None        # (north, east, down, yaw) where the smoke was last seen
+    recoveries = 0
     while time.time() < deadline:
         tgt = detection.get_latest_target(max_age=max_age)
         if tgt is None:
-            # Smoke flickers in/out — hover in place through brief dropouts, give
-            # up (so the mission relocates) only if it stays lost past the grace.
+            # Smoke flickers in/out — hover in place through brief dropouts. Once
+            # it stays lost past the grace, fly BACK to the last vantage where it
+            # was solidly seen and re-frame there (rather than roaming away). Only
+            # if that fails after a few tries do we hand back to relocate.
             mav.move_body_velocity_yaw(vehicle, 0.0, 0.0, 0.0)
             if time.time() - last_seen > lost_grace:
-                log.warning("Approach — target lost for %.0f s — relocating to re-find it", lost_grace)
+                log.warning("Approach — target lost for %.0f s", lost_grace)
+                if last_good is not None and recoveries < max_recov and \
+                        _return_and_reacquire(last_good):
+                    recoveries += 1
+                    last_seen = time.time()
+                    deadline = time.time() + time_budget   # fresh budget for the resumed approach
+                    continue
+                log.warning("Approach — recovery exhausted — relocating to re-find it")
                 return False
             time.sleep(0.1)
             continue
         last_seen = time.time()
+        try:                       # remember this vantage to fly back to if we lose the smoke
+            _p = mav.get_local_position(vehicle)
+            last_good = (_p["north"], _p["east"], _p["down"], mav._current_yaw_rad(vehicle))
+        except Exception:
+            pass
 
         # Close enough → stop and hand off to the descend+orbit. Either the bbox
         # fills the frame, OR the detection coincides with a LiDAR obstacle right
