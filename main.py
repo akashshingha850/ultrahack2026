@@ -8,8 +8,10 @@ MISSION: ULTRAHACK 2026  (indoor, optical-flow EKF — no GPS / no compass)
 2. Pilot arms and selects GUIDED; that (GUIDED + armed) starts the mission. The
    code only checks for both — it never arms the motors itself.
 3. Detection first: if the primary (smoke) is already in view, go straight to the
-   approach. Otherwise ascend, then spin 360° — both FAILSAFES, aborted the moment
-   anything is detected.
+   approach. Otherwise dash ~20 m straight ahead (the target is expected about
+   that far in front of the start) — detection runs the whole way and aborts the
+   dash to the approach. Only if the dash finds nothing: ascend, then spin 360°
+   — both FAILSAFES, aborted the moment anything is detected.
 4. Reactively roam open space (open_path_explore) until the primary is found.
 5. Visual-servo approach until the front LiDAR reads ~3 m, then stop.
 6. Orbit the block ONLY if a secondary target (human/fire) is still missing.
@@ -27,7 +29,7 @@ import siyi
 import lidar as lidar_module
 import proximity_check
 from utils import (
-    setup_logging, wait_for_guided, climb_to, collect_spin_profile,
+    setup_logging, wait_for_guided, climb_to, dash_forward, collect_spin_profile,
     open_path_explore, approach_target, orbital_scan,
 )
 
@@ -104,14 +106,20 @@ def main() -> None:
     max_retries = cfg.get("approach", {}).get("relocate_retries", 4)
     lidar_cfg   = cfg.get("lidar", {})
 
-    # ── Detection-first; ascend + spin are FAILSAFES ──────────────────────────
+    # ── Detection-first; dash forward, then ascend + spin as FAILSAFES ────────
     # There is a good chance the target is already visible on GUIDED entry — in
-    # that case we skip straight to the approach. Only when nothing is in view do
-    # we climb for a better vantage and then spin to look around; both abort the
-    # instant something is detected.
+    # that case we skip straight to the approach. Otherwise the target is
+    # expected ~20 m straight ahead of the start, so dash that far forward
+    # first (detection live the whole way, aborting to the approach on sight)
+    # before any scanning or dynamic waypoint planning. Only when the dash
+    # finds nothing do we climb for a better vantage and then spin to look
+    # around; both abort the instant something is detected.
+    dash_m = flight_cfg.get("forward_dash_m", 0.0)
     target_bearing = None
     if target_found.is_set():
-        log.info("Primary already in view on GUIDED entry — skipping ascend/spin, going to approach")
+        log.info("Primary already in view on GUIDED entry — skipping dash/ascend/spin, going to approach")
+    elif dash_m > 0 and dash_forward(vehicle, lidar, target_found, cfg, distance=dash_m):
+        log.info("Primary found during the forward dash — skipping ascend/spin, going to approach")
     else:
         climb_to(vehicle, scan_alt, target_found=target_found)   # failsafe ascend
         if target_found.is_set():

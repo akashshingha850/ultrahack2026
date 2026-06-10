@@ -5,10 +5,10 @@ connection:
   # Serial: /dev/ttyUSB0 (baud rate applies)
   # UDP:    udp:127.0.0.1:14550
   # TCP:    tcp:127.0.0.1:5760
-  # string: "udpin:0.0.0.0:14500"
-  string: "/dev/ttyTHS1"
-  # baud: 57600
-  baud: 115200
+  string: "udpin:0.0.0.0:14500"
+  # string: "/dev/ttyTHS1"
+  baud: 57600
+  # baud: 115200
   source_system: 255
   timeout: 60               # seconds to wait for heartbeat
 
@@ -21,6 +21,10 @@ flight:
   # each retry (capped) for a better view — addresses "not high enough to see it".
   search_climb_step_m:     2.0    # extra altitude added per relocate attempt (m)
   max_search_altitude_m:   11.0   # cap on the relocate search altitude (m AGL)
+  # The target is expected roughly this far straight ahead of the start point —
+  # dash that far forward (detection live, abort on sight, LiDAR wall-safe)
+  # BEFORE the scan/spin failsafes and dynamic waypoint planning. 0 = disabled.
+  forward_dash_m:          20.0
 
 coverage:
   # Radius = FENCE_RADIUS − FENCE_MARGIN (both read from the vehicle).
@@ -73,8 +77,8 @@ nbv:
   revisit_radius_m:  5.0    # metres – radius considered "already visited"
 
 stream:
-  input:  "rtsp://192.168.144.25:8554/main.264"
-  # input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
+  # input:  "rtsp://192.168.144.25:8554/main.264"
+  input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
   output: "rtsp://0.0.0.0:8555/live"
   record_dir: "recordings"   # annotated output feed is also saved here as <timestamp>.mp4 ("" = off)
 

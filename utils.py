@@ -99,6 +99,85 @@ def climb_to(vehicle, altitude: float, tol: float = 0.4, timeout: float = 25.0,
                 altitude, timeout, cur_alt)
 
 
+def dash_forward(vehicle, lidar, target_found: threading.Event, cfg: dict,
+                 distance: float = 20.0) -> bool:
+    """Fly *distance* m straight ahead along the current heading at the scan
+    altitude, BEFORE any scanning or dynamic waypoint planning — the target is
+    expected roughly that far in front of the start position.
+
+    Detection has priority: the dash is aborted the moment the primary is seen
+    so the visual-servo approach can take over from right there. LiDAR-safe:
+    the leg is cut short when a wall comes within the exploration replan
+    distance ahead (ArduPilot OA would brake us anyway — better to hand over to
+    the explorer, which knows how to pick a new direction).
+
+    Returns True if the target was found during the dash.
+    """
+    import mav
+
+    flight_cfg  = cfg.get("flight", {})
+    exp_cfg     = cfg.get("exploration", {})
+    speed       = flight_cfg.get("speed", 3.0)
+    alt         = flight_cfg.get("altitude", 5.0)
+    stop_dist   = exp_cfg.get("stop_dist_m", 5.0)
+    accept_rad  = 2.0          # "arrived" radius (m)
+    keepalive_s = 2.0          # re-send SAME wp this often (under GUIDED's ~3 s timeout)
+    timeout     = max(30.0, 3.0 * distance / max(speed, 0.1))
+    target_down = -abs(alt)
+
+    pos = mav.get_local_position(vehicle)
+    yaw = mav._current_yaw_rad(vehicle)
+    wp_n = pos["north"] + distance * math.cos(yaw)
+    wp_e = pos["east"]  + distance * math.sin(yaw)
+
+    log.info("Forward dash — %.0f m ahead along heading %.0f° → N=%.1f E=%.1f at %.1f m "
+             "(detection live, abort on sight; stop if wall ≤%.1f m ahead)",
+             distance, math.degrees(yaw) % 360, wp_n, wp_e, alt, stop_dist)
+
+    mav.goto_ned(vehicle, wp_n, wp_e, target_down, speed=speed)
+    last_send = time.time()
+    deadline  = time.time() + timeout
+
+    while time.time() < deadline:
+        # Target spotted → stop and hold; the approach takes over from here.
+        if target_found.is_set():
+            log.info("Forward dash — target detected mid-dash, stopping for approach")
+            mav.move_body_velocity_yaw(vehicle, 0.0, 0.0, 0.0)
+            return True
+
+        try:
+            pos = mav.get_local_position(vehicle)
+        except RuntimeError:
+            time.sleep(0.2); continue
+
+        if math.hypot(wp_n - pos["north"], wp_e - pos["east"]) <= accept_rad:
+            log.info("Forward dash complete (%.0f m) — nothing seen on the way, "
+                     "handing over to scan/explore", distance)
+            return False
+
+        # Wall safety: the waypoint is straight ahead of the start heading, so
+        # the body-0 beam looks along the direction of travel.
+        try:
+            ahead = lidar.get_directions(timeout=1.0).get(0, float("inf"))
+        except TimeoutError:
+            ahead = float("inf")
+        if ahead <= stop_dist:
+            log.warning("Forward dash — wall %.1f m ahead, cutting the leg short", ahead)
+            mav.move_body_velocity_yaw(vehicle, 0.0, 0.0, 0.0)
+            return target_found.is_set()
+
+        now = time.time()
+        if now - last_send >= keepalive_s:
+            # Re-send the SAME waypoint to keep GUIDED alive without restarting
+            # the S-curve (same pattern as open_path_explore).
+            mav.goto_ned(vehicle, wp_n, wp_e, target_down)
+            last_send = now
+        time.sleep(0.2)
+
+    log.warning("Forward dash timed out after %.0f s — handing over to scan/explore", timeout)
+    return target_found.is_set()
+
+
 # ---------------------------------------------------------------------------
 # LiDAR spin phase
 # ---------------------------------------------------------------------------
