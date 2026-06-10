@@ -14,6 +14,8 @@ import time
 import numpy as np
 from pymavlink import mavutil
 
+import mav
+
 log = logging.getLogger(__name__)
 
 # MAVLink message IDs
@@ -31,11 +33,12 @@ class LidarReader:
         # MAV_SENSOR_ROTATION_YAW_*). Keep the latest of EACH so we can build a
         # real 360° profile instead of discarding 7 of every 8 beams.
         self._distance_by_orient: dict[int, object] = {}
-        self._stop_event = threading.Event()
         self._obstacle_event = threading.Event()  # set each time a new OBSTACLE_DISTANCE arrives
 
-        self._thread = threading.Thread(target=self._listener_thread, daemon=True)
-        self._thread.start()
+        # Don't open a second reader on the shared link — that would steal
+        # messages from the control loop. Subscribe to mav's single reader thread
+        # so we see every OBSTACLE_DISTANCE / DISTANCE_SENSOR as it arrives.
+        mav.subscribe(vehicle, self._on_message)
 
     # ------------------------------------------------------------------
     # Stream setup
@@ -59,31 +62,27 @@ class LidarReader:
     # Background listener
     # ------------------------------------------------------------------
 
-    def _listener_thread(self) -> None:
-        while not self._stop_event.is_set():
-            msg = self._vehicle.recv_match(
-                type=["OBSTACLE_DISTANCE", "DISTANCE_SENSOR"],
-                blocking=True,
-                timeout=0.2,
-            )
-            if msg is None:
-                continue
-            with self._lock:
-                if msg.get_type() == "OBSTACLE_DISTANCE":
-                    valid_pts = sum(1 for d in msg.distances if 0 < d < 65535)
-                    log.debug("OBSTACLE_DISTANCE  valid_pts=%d/72", valid_pts)
-                    self._latest_obstacle = msg
+    def _on_message(self, msg) -> None:
+        """Invoked by mav's single reader thread for every received message."""
+        mtype = msg.get_type()
+        if mtype not in ("OBSTACLE_DISTANCE", "DISTANCE_SENSOR"):
+            return
+        with self._lock:
+            if mtype == "OBSTACLE_DISTANCE":
+                valid_pts = sum(1 for d in msg.distances if 0 < d < 65535)
+                log.debug("OBSTACLE_DISTANCE  valid_pts=%d/72", valid_pts)
+                self._latest_obstacle = msg
+                self._obstacle_event.set()
+            else:
+                # DISTANCE_SENSOR — SITL sends 8 of these (one per 45°
+                # orientation). Keep the latest of every orientation so a
+                # full 360° profile can be synthesised from all beams.
+                self._latest_distance = msg
+                self._distance_by_orient[int(msg.orientation)] = msg
+                if self._latest_obstacle is None:
+                    # No full OBSTACLE_DISTANCE plugin — drive callers from
+                    # the per-orientation DISTANCE_SENSOR set instead.
                     self._obstacle_event.set()
-                else:
-                    # DISTANCE_SENSOR — SITL sends 8 of these (one per 45°
-                    # orientation). Keep the latest of every orientation so a
-                    # full 360° profile can be synthesised from all beams.
-                    self._latest_distance = msg
-                    self._distance_by_orient[int(msg.orientation)] = msg
-                    if self._latest_obstacle is None:
-                        # No full OBSTACLE_DISTANCE plugin — drive callers from
-                        # the per-orientation DISTANCE_SENSOR set instead.
-                        self._obstacle_event.set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -240,8 +239,7 @@ class LidarReader:
         return walls
 
     def close(self) -> None:
-        self._stop_event.set()
-        self._thread.join(timeout=2.0)
+        mav.unsubscribe(self._vehicle, self._on_message)
         # Disable OBSTACLE_DISTANCE stream
         self._vehicle.mav.command_long_send(
             self._vehicle.target_system,

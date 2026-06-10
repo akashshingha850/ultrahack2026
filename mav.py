@@ -9,11 +9,166 @@ All blocking calls raise RuntimeError on timeout or rejection.
 
 import logging
 import math
+import threading
 import time
 
 from pymavlink import mavutil
 
 log = logging.getLogger(__name__)
+
+
+# Idle poll interval for the single reader thread when no bytes are waiting (s).
+_POLL_INTERVAL_S = 0.005
+
+
+def _attach_reader(vehicle: mavutil.mavfile) -> mavutil.mavfile:
+    """Make the one shared MAVLink link safe for concurrent use: ONE reader,
+    everyone else reads the cache.
+
+    A pymavlink ``mavfile`` is NOT thread-safe AND ``recv_match`` *consumes* the
+    single shared byte stream — it reads the next message and discards it if it
+    doesn't match the caller's ``type`` filter. So two threads each calling
+    ``recv_match`` with different filters (the LiDAR listener vs. the control
+    loop) steal each other's messages: the LiDAR thread drained LOCAL_POSITION_NED
+    off the stream and threw it away before ``get_local_position`` could match it.
+    A lock alone stops byte corruption but NOT this message theft.
+
+    ``recv_msg`` already caches every parsed message per-type in
+    ``vehicle.messages``. So we run a single dedicated reader thread that
+    continuously drains the link into that cache, and replace ``recv_match`` with
+    a version that serves from the cache (waiting for a freshly-arrived message of
+    the requested type for blocking calls). Sends are serialised against the
+    reader with one I/O lock by wrapping ``vehicle.mav.send`` (the chokepoint all
+    ``*_send`` helpers funnel through). Other modules needing every message
+    (LiDAR) register via :func:`subscribe` instead of opening a second reader.
+    """
+    io_lock = threading.RLock()          # serialises raw link I/O: read-drain vs. send
+    state   = threading.Condition()      # guards _last_ts + wakes blocking readers
+    last_ts: "dict[str, float]" = {}     # msg type -> monotonic time it last arrived
+    subscribers: list = []
+
+    orig_recv_match = vehicle.recv_match
+    orig_send = vehicle.mav.send
+    stop = threading.Event()
+
+    def _reader() -> None:
+        while not stop.is_set():
+            batch = []
+            with io_lock:
+                # Drain everything currently buffered in one lock hold; recv_match
+                # with blocking=False returns None once the buffer is empty.
+                for _ in range(100):
+                    m = orig_recv_match(blocking=False)
+                    if m is None:
+                        break
+                    batch.append(m)
+            if not batch:
+                time.sleep(_POLL_INTERVAL_S)
+                continue
+            now = time.monotonic()
+            with state:
+                for m in batch:
+                    last_ts[m.get_type()] = now   # vehicle.messages[type] already set by recv_msg
+                state.notify_all()
+            for m in batch:
+                for cb in list(subscribers):
+                    try:
+                        cb(m)
+                    except Exception:
+                        log.exception("MAVLink subscriber raised")
+
+    def safe_send(*args, **kwargs):
+        with io_lock:
+            return orig_send(*args, **kwargs)
+
+    def cached_recv_match(condition=None, type=None, blocking=False, timeout=None):
+        if isinstance(type, str):
+            types = [type]
+        elif type:
+            types = list(type)
+        else:
+            types = None
+        start = time.monotonic()
+        deadline = None if timeout is None else start + (timeout or 0.0)
+
+        def _pick(require_fresh: bool):
+            best, best_ts = None, -1.0
+            for ty in (types if types is not None else list(last_ts.keys())):
+                ts = last_ts.get(ty)
+                if ts is None or (require_fresh and ts < start):
+                    continue
+                if ts > best_ts:
+                    msg = vehicle.messages.get(ty)
+                    if msg is not None:
+                        best, best_ts = msg, ts
+            return best
+
+        with state:
+            if not blocking:
+                return _pick(require_fresh=False)
+            while True:
+                msg = _pick(require_fresh=True)
+                if msg is not None:
+                    return msg
+                if deadline is None:
+                    state.wait(timeout=0.1)
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    state.wait(timeout=min(0.1, remaining))
+
+    vehicle._io_lock = io_lock
+    vehicle._reader_stop = stop
+    vehicle._subscribers = subscribers
+    vehicle.recv_match = cached_recv_match
+    vehicle.mav.send = safe_send
+
+    t = threading.Thread(target=_reader, name="mav-reader", daemon=True)
+    t.start()
+    vehicle._reader_thread = t
+    return vehicle
+
+
+def subscribe(vehicle: mavutil.mavfile, callback) -> None:
+    """Register *callback(msg)* to run for EVERY received MAVLink message, from the
+    single reader thread. Use this instead of opening a second ``recv_match`` loop
+    on the same link (which would steal messages from the control loop)."""
+    vehicle._subscribers.append(callback)
+
+
+def unsubscribe(vehicle: mavutil.mavfile, callback) -> None:
+    try:
+        vehicle._subscribers.remove(callback)
+    except ValueError:
+        pass
+
+
+# Messages the control loop reads (mav.get_local_position / get_attitude /
+# _current_relative_alt / get_battery). A companion serial link streams NOTHING
+# by default — the FC only sends what's explicitly requested — so these must be
+# turned on or recv_match for them times out forever. {MAVLink msg id: rate Hz}.
+_CONTROL_STREAMS = {
+    32: 10.0,   # LOCAL_POSITION_NED  — position & velocity (waypoint tracking)
+    30: 10.0,   # ATTITUDE            — yaw for body-frame moves
+    33:  5.0,   # GLOBAL_POSITION_INT — relative altitude
+    1:   2.0,   # SYS_STATUS          — battery fallback
+}
+
+
+def request_data_streams(vehicle: mavutil.mavfile,
+                         streams: "dict[int, float] | None" = None) -> None:
+    """Ask the FC to stream the telemetry the control loop needs. Required on
+    companion links, which send nothing unless requested (SRx_* default to 0)."""
+    for msg_id, rate_hz in (streams or _CONTROL_STREAMS).items():
+        interval_us = 0.0 if rate_hz <= 0 else 1_000_000.0 / rate_hz
+        vehicle.mav.command_long_send(
+            vehicle.target_system, vehicle.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+            float(msg_id), interval_us, 0, 0, 0, 0, 0,
+        )
+        log.debug("Requested msg_id=%d at %.1f Hz", msg_id, rate_hz)
+
 
 def connect(connection_string: str, baud: int = 57600,
             source_system: int = 255, timeout: int = 30) -> mavutil.mavfile:
@@ -25,6 +180,12 @@ def connect(connection_string: str, baud: int = 57600,
         raise RuntimeError(f"No heartbeat within {timeout} s")
     log.info("Heartbeat from system %d component %d",
              vehicle.target_system, vehicle.target_component)
+    # Start the single reader (and serialise sends) BEFORE any other consumer
+    # (LidarReader / the control loop) starts sharing this link.
+    _attach_reader(vehicle)
+    # Companion links stream nothing by default — request the control-loop
+    # telemetry now so get_local_position()/get_attitude() don't time out.
+    request_data_streams(vehicle)
     return vehicle
 
 
