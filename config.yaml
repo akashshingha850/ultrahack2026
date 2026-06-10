@@ -5,16 +5,16 @@ connection:
   # Serial: /dev/ttyUSB0 (baud rate applies)
   # UDP:    udp:127.0.0.1:14550
   # TCP:    tcp:127.0.0.1:5760
-  string: "udpin:0.0.0.0:14500"
-  # string: "/dev/ttyTHS1"
-  baud: 57600
-  # baud: 115200
+  # string: "udpin:0.0.0.0:14500"
+  string: "/dev/ttyTHS1"
+  # baud: 57600
+  baud: 115200
   source_system: 255
   timeout: 60               # seconds to wait for heartbeat
 
 flight:
   altitude: 5.0            # metres AGL for survey passes
-  speed: 5.0                # m/s groundspeed during coverage
+  speed: 3.0                # m/s groundspeed during coverage
   takeoff_altitude: 5.0    # metres AGL to climb before starting
   rtl_altitude: 5.0        # metres AGL for RTL
   # When the approach loses the target and relocates, roam this much higher on
@@ -73,8 +73,8 @@ nbv:
   revisit_radius_m:  5.0    # metres – radius considered "already visited"
 
 stream:
-  # input:  "rtsp://192.168.144.25:8554/main.264"
-  input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
+  input:  "rtsp://192.168.144.25:8554/main.264"
+  # input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
   output: "rtsp://0.0.0.0:8555/live"
   record_dir: "recordings"   # annotated output feed is also saved here as <timestamp>.mp4 ("" = off)
 

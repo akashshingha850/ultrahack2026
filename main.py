@@ -3,9 +3,10 @@
 """
 MISSION: ULTRAHACK 2026  (indoor, optical-flow EKF — no GPS / no compass)
 
-1. Record from the start: SIYI onboard recording + the YOLO detection/annotated
-   MediaMTX stream (also saved to recordings/).
-2. Pilot takes off manually in LOITER; selecting GUIDED starts the mission.
+1. The YOLO detection/annotated MediaMTX stream (also saved to recordings/) runs
+   from program launch; SIYI onboard recording starts when the mission starts.
+2. Pilot arms and selects GUIDED; that (GUIDED + armed) starts the mission. The
+   code only checks for both — it never arms the motors itself.
 3. Detection first: if the primary (smoke) is already in view, go straight to the
    approach. Otherwise ascend, then spin 360° — both FAILSAFES, aborted the moment
    anything is detected.
@@ -43,15 +44,9 @@ def main() -> None:
     primary   = targets.get("primary", "smoke")
     secondary = targets.get("secondary", [])
 
-    # ── Recording starts immediately, before any flight ───────────────────────
-    # SIYI onboard recording (to the camera card) is independent of the YOLO feed
-    # recording; wrap it so a missing/offline camera never aborts the mission.
+    # SIYI onboard recording (to the camera card) is triggered when the mission
+    # actually starts (GUIDED + armed), not at program launch — see below.
     camera = None
-    try:
-        camera = siyi.connect()
-        siyi.start_recording(camera)
-    except Exception as exc:
-        log.warning("SIYI camera recording not started (%s) — continuing without it", exc)
 
     # Detection + annotated stream (+ stream recording) — runs the whole mission.
     # The PRIMARY drives guidance/target_found; secondaries are tracked for the
@@ -84,8 +79,19 @@ def main() -> None:
     else:
         log.info("LiDAR pre-check disabled (lidar.precheck=false) — skipping")
 
-    # Pilot takes off manually in LOITER; selecting GUIDED is the "go" signal.
+    # Mission go-signal: the pilot arms and selects GUIDED. The code only checks
+    # for GUIDED + armed (it never arms the motors itself); both are required for
+    # the drone to get airborne.
     wait_for_guided(vehicle)
+
+    # Mission has started — trigger SIYI onboard recording now. Wrapped so a
+    # missing/offline camera never aborts the mission.
+    try:
+        camera = siyi.connect()
+        siyi.start_recording(camera)
+        log.info("SIYI onboard recording started")
+    except Exception as exc:
+        log.warning("SIYI camera recording not started (%s) — continuing without it", exc)
 
     lidar = lidar_module.LidarReader(vehicle)
     lidar.request_streams()
