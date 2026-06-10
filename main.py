@@ -24,6 +24,7 @@ import mav
 import detection
 import siyi
 import lidar as lidar_module
+import proximity_check
 from utils import (
     setup_logging, wait_for_guided, climb_to, collect_spin_profile,
     open_path_explore, approach_target, orbital_scan,
@@ -69,8 +70,19 @@ def main() -> None:
     )
     log.info("Vehicle connected")
 
-    if not mav.check_lidar_available(vehicle, timeout=3.0):
-        raise RuntimeError("No LiDAR data — check PRX1_TYPE and proximity plugin")
+    # Optional pre-flight LiDAR check. Soft by design: a missing sensor only
+    # warns and the mission proceeds (FC avoidance still runs). Toggle via
+    # config `lidar.precheck`.
+    lidar_precheck = cfg.get("lidar", {}).get("precheck", True)
+    if lidar_precheck:
+        precheck_timeout = cfg.get("lidar", {}).get("precheck_timeout_s", 3.0)
+        if proximity_check.check_lidar_available(vehicle, timeout=precheck_timeout):
+            log.info("LiDAR proximity data confirmed")
+        else:
+            log.warning("No LiDAR proximity data — continuing without it "
+                        "(check PRX1_TYPE / proximity plugin)")
+    else:
+        log.info("LiDAR pre-check disabled (lidar.precheck=false) — skipping")
 
     # Pilot takes off manually in LOITER; selecting GUIDED is the "go" signal.
     wait_for_guided(vehicle)

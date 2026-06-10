@@ -5,10 +5,10 @@ connection:
   # Serial: /dev/ttyUSB0 (baud rate applies)
   # UDP:    udp:127.0.0.1:14550
   # TCP:    tcp:127.0.0.1:5760
-  string: "udpin:0.0.0.0:14500"
-  # string: "/dev/ttyTHS1"
-  baud: 57600
-  # baud: 115200
+  # string: "udpin:0.0.0.0:14500"
+  string: "/dev/ttyTHS1"
+  # baud: 57600
+  baud: 115200
   source_system: 255
   timeout: 60               # seconds to wait for heartbeat
 
@@ -73,8 +73,8 @@ nbv:
   revisit_radius_m:  5.0    # metres – radius considered "already visited"
 
 stream:
-  # input:  "rtsp://192.168.144.25:8554/main.264"
-  input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
+  input:  "rtsp://192.168.144.25:8554/main.264"
+  # input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
   output: "rtsp://0.0.0.0:8555/live"
   record_dir: "recordings"   # annotated output feed is also saved here as <timestamp>.mp4 ("" = off)
 
@@ -159,6 +159,8 @@ exploration:
   step_timeout_s:   12     # 40 m / 5 m/s = 8 s; 12 s gives margin
 
 lidar:
+  precheck: true            # pre-flight LiDAR availability check (soft — never aborts)
+  precheck_timeout_s: 3.0   # seconds to wait for OBSTACLE_DISTANCE/DISTANCE_SENSOR
   obstacle_distance_rate_hz: 10
   stream_timeout_s: 2.0
   spin_duration_s: 8.0     # floor only; the spin now runs until a tracked full 360°
