@@ -22,6 +22,7 @@ import lidar as lidar_module
 from utils import (
     setup_logging, wait_for_guided, climb_to, collect_spin_profile,
     open_path_explore, approach_target, orbital_scan,
+    TrailRecorder, return_home_and_land,
 )
 
 log = logging.getLogger("main")
@@ -59,6 +60,12 @@ def main() -> None:
 
     wait_for_guided(vehicle)
 
+    # Record a breadcrumb trail of everywhere we fly from here on, so that once
+    # the target is scanned we can retrace the same collision-checked path back
+    # to origin and land, instead of cutting blindly across the arena.
+    trail = TrailRecorder(vehicle)
+    trail.start()
+
     # ── Initial spin ──────────────────────────────────────────────────────
     # A 360° at the start position: cheap insurance for a target that is
     # beside/behind the drone at launch, and a chance to detect before we move.
@@ -70,24 +77,30 @@ def main() -> None:
     lidar.request_streams()
     time.sleep(0.5)
 
-    # Climb to the configured scan altitude before spinning/searching, so the
-    # whole scan runs at a fixed height (e.g. 5 m) instead of wherever the
-    # vehicle happened to be when handed over in GUIDED.
+    # Detection has priority over altitude: climb toward the scan height only
+    # while nothing is in view. The moment YOLO sees the target — already, or
+    # partway up — we abandon the climb and go straight to approaching it.
     scan_alt = cfg.get("flight", {}).get("altitude", 5.0)
-    climb_to(vehicle, scan_alt)
+    climb_to(vehicle, scan_alt, target_found=target_found)
 
-    spin_dur   = lidar_cfg.get("spin_duration_s", 20.0)
-    spin_speed = lidar_cfg.get("spin_speed_deg_s", 20.0)
-    spin_max   = lidar_cfg.get("spin_max_duration_s", 45.0)
-    log.info("Starting 360° spin (%.0f °/s commanded) — full turn unless the target "
-             "is seen first (safety cap %.0f s)", spin_speed, spin_max)
-    mav.rotate_right(vehicle, 360, speed_deg_s=spin_speed)
-    hfov = cfg.get("camera", {}).get("hfov_deg", 82.6)
-    room_profile, target_bearing = collect_spin_profile(
-        vehicle, lidar, spin_duration=spin_dur, target_found=target_found,
-        spin_speed=spin_speed, max_duration=spin_max, camera_hfov_deg=hfov)
-    log.info("Spin complete — %d/360 angles with valid range data",
-             int(sum(1 for v in room_profile if v != float("inf"))))
+    target_bearing = None
+    if target_found.is_set():
+        # Already in view (during the climb or before it) — don't bother spinning,
+        # head straight for it.
+        log.info("Target already in view — skipping the 360° spin, going to approach")
+    else:
+        spin_dur   = lidar_cfg.get("spin_duration_s", 20.0)
+        spin_speed = lidar_cfg.get("spin_speed_deg_s", 20.0)
+        spin_max   = lidar_cfg.get("spin_max_duration_s", 45.0)
+        log.info("Starting 360° spin (%.0f °/s commanded) — full turn unless the target "
+                 "is seen first (safety cap %.0f s)", spin_speed, spin_max)
+        mav.rotate_right(vehicle, 360, speed_deg_s=spin_speed)
+        hfov = cfg.get("camera", {}).get("hfov_deg", 82.6)
+        room_profile, target_bearing = collect_spin_profile(
+            vehicle, lidar, spin_duration=spin_dur, target_found=target_found,
+            spin_speed=spin_speed, max_duration=spin_max, camera_hfov_deg=hfov)
+        log.info("Spin complete — %d/360 angles with valid range data",
+                 int(sum(1 for v in room_profile if v != float("inf"))))
 
     # ── Search → approach → relocate loop ────────────────────────────────────
     # Reactive open-path explorer finds the target (camera detects while moving);
@@ -140,16 +153,25 @@ def main() -> None:
             target_found.clear()      # force a fresh re-detection from the new vantage
     finally:
         lidar.close()
+        trail.stop()
 
-    # ── BRAKE ───────────────────────────────────────────────────────────────
+    # ── Return home & land ────────────────────────────────────────────────────
     if reached:
-        log.info("Target reached and scanned — BRAKE")
+        log.info("Target reached and scanned — retracing the path back to origin to land")
+        try:
+            return_home_and_land(vehicle, trail.trail, cfg)
+        except Exception as exc:
+            log.warning("Return-home failed (%s) — BRAKE instead", exc)
+            try:
+                mav.set_mode(vehicle, "BRAKE")
+            except Exception as exc2:
+                log.warning("BRAKE mode set failed: %s", exc2)
     else:
-        log.warning("Mission ended without reaching the target — BRAKE anyway")
-    try:
-        mav.set_mode(vehicle, "BRAKE")
-    except Exception as exc:
-        log.warning("BRAKE mode set failed: %s", exc)
+        log.warning("Mission ended without reaching the target — BRAKE")
+        try:
+            mav.set_mode(vehicle, "BRAKE")
+        except Exception as exc:
+            log.warning("BRAKE mode set failed: %s", exc)
 
 
 if __name__ == "__main__":

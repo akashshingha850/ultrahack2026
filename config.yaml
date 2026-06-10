@@ -118,8 +118,9 @@ approach:
 # pointed inward so the camera captures it from every side. LiDAR-safe: any leg
 # whose travel direction is blocked within safe_clear_m is skipped.
 orbit:
-  radius_m:        6.0    # orbit radius around the target (m)
-  target_distance_m: 6.0  # assumed distance to the target straight ahead (vision only, no LiDAR)
+  radius_m:        6.0    # fallback orbit radius when no forward LiDAR reading (m)
+  target_distance_m: 6.0  # fallback distance to the target ahead when no LiDAR (m)
+  min_radius_m:    3.0    # never orbit tighter than this, even if LiDAR reads closer (m)
   altitude_m:      3.0    # AGL to descend to before orbiting (null = hold current altitude)
   safe_clear_m:    2.5    # skip an orbit leg if LiDAR clearance toward it is below this (m)
   step_deg:        15.0   # angular spacing between orbit waypoints (deg)

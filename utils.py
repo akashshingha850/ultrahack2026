@@ -53,11 +53,16 @@ def wait_for_guided(vehicle) -> None:
     log.info("GUIDED mode confirmed")
 
 
-def climb_to(vehicle, altitude: float, tol: float = 0.4, timeout: float = 25.0) -> None:
+def climb_to(vehicle, altitude: float, tol: float = 0.4, timeout: float = 25.0,
+             target_found: "threading.Event | None" = None) -> None:
     """Climb/descend to *altitude* m AGL over the current position and hold, so
     the whole scan (spin + search) runs at a fixed height. NED down is negative
     up, so the target is -altitude. Re-issues the setpoint each cycle to keep
-    GUIDED from timing out during the climb."""
+    GUIDED from timing out during the climb.
+
+    Detection has priority over the climb: if *target_found* becomes set partway
+    up, the ascent is abandoned immediately so we can start moving closer instead
+    of wasting altitude. The drone only keeps climbing while nothing is in view."""
     import mav
     target_down = -abs(altitude)
     start = mav.get_local_position(vehicle)
@@ -65,6 +70,14 @@ def climb_to(vehicle, altitude: float, tol: float = 0.4, timeout: float = 25.0) 
              altitude, -start["down"])
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if target_found is not None and target_found.is_set():
+            try:
+                cur_alt = -mav.get_local_position(vehicle)["down"]
+            except RuntimeError:
+                cur_alt = float("nan")
+            log.info("Target detected during climb at %.1f m — stopping ascent, "
+                     "moving to approach instead", cur_alt)
+            return
         mav.goto_ned(vehicle, start["north"], start["east"], target_down)
         try:
             cur = mav.get_local_position(vehicle)
@@ -158,6 +171,13 @@ def collect_spin_profile(vehicle, lidar, spin_duration: float = 20.0,
         except TimeoutError:
             log.debug("LiDAR timeout during spin — skipping snapshot (swept=%.0f°)", accumulated)
         time.sleep(0.2)
+
+    # Explicitly halt the yaw on the way out, no matter how we exited the loop.
+    # The CONDITION_YAW 360 command can still be executing inside the FC when our
+    # measured-sweep loop ends, and that residual rotation would carry the drone
+    # past one full turn into a second spin. Cancelling it here guarantees exactly
+    # one 360°.
+    mav.move_body_velocity_yaw(vehicle, 0.0, 0.0, 0.0)
 
     if accumulated < target_deg:
         log.warning("Spin stopped after %.0f° (safety cap %.0f s) — profile may be partial",
@@ -508,6 +528,8 @@ def orbital_scan(vehicle, lidar, target_found: threading.Event, cfg: dict) -> bo
     wp_timeout  = orb.get("wp_timeout_s", 20)         # per-waypoint timeout
     safe_clear  = orb.get("safe_clear_m", 2.5)        # skip a leg if LiDAR shows less clearance toward it
 
+    min_radius  = orb.get("min_radius_m", 3.0)        # never orbit tighter than this (m)
+
     try:
         pos = mav.get_local_position(vehicle)
         yaw = mav._current_yaw_rad(vehicle)
@@ -515,7 +537,26 @@ def orbital_scan(vehicle, lidar, target_found: threading.Event, cfg: dict) -> bo
         log.warning("Orbital scan — no pose available (%s), skipping", exc)
         return False
 
-    # Estimate the target centre: straight ahead at the assumed target distance.
+    # Prefer the LIVE forward LiDAR range to the target over the assumed distance:
+    # the approach stops when detection + LiDAR fire together, so the beam dead
+    # ahead is the real standoff to the target. Orbit at that distance (clamped to
+    # a sane minimum) so the target sits at the centre of the circle and the drone
+    # starts already on the ring instead of having to fly in or out. Fall back to
+    # the configured distance only when there is no usable reading.
+    try:
+        fwd = lidar.get_directions(timeout=0.5).get(0, float("inf"))
+    except TimeoutError:
+        fwd = float("inf")
+    if math.isfinite(fwd) and fwd >= min_radius:
+        target_dist = fwd
+        radius = max(min_radius, fwd)
+        log.info("Orbital scan — using measured forward range %.1f m as the orbit radius", fwd)
+    else:
+        radius = max(min_radius, radius)
+        log.info("Orbital scan — no usable forward LiDAR (%.1f m); using configured radius %.1f m",
+                 fwd, radius)
+
+    # Estimate the target centre: straight ahead at the (measured) target distance.
     # The nose is on the target after the vision approach, so project forward.
     center_n = pos["north"] + target_dist * math.cos(yaw)
     center_e = pos["east"]  + target_dist * math.sin(yaw)
@@ -523,6 +564,7 @@ def orbital_scan(vehicle, lidar, target_found: threading.Event, cfg: dict) -> bo
     # Descend (or climb) to the orbit altitude before circling — e.g. drop to 3 m.
     orbit_alt = abs(orb.get("altitude_m")) if orb.get("altitude_m") is not None else -pos["down"]
     target_down = -orbit_alt
+    log.info("Orbital scan — descending to %.1f m AGL before circling", orbit_alt)
     climb_to(vehicle, orbit_alt)
 
     log.info("Orbital scan — block centre N=%.1f E=%.1f (range %.1f m), radius %.1f m, "
@@ -575,3 +617,100 @@ def orbital_scan(vehicle, lidar, target_found: threading.Event, cfg: dict) -> bo
 
     log.info("Orbital scan complete — %d viewpoints around the block", n_steps + 1)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Breadcrumb trail + return-home
+# ---------------------------------------------------------------------------
+
+class TrailRecorder(threading.Thread):
+    """Background sampler that records where the drone flies as an NED breadcrumb
+    trail, so the mission can retrace the SAME (already collision-checked) path
+    back to origin afterwards rather than risk a blind straight line home.
+
+    Samples the local position every *period_s* and appends a point only once the
+    drone has moved at least *min_step_m* from the last breadcrumb, keeping the
+    trail sparse. Runs as a daemon so it never blocks shutdown."""
+
+    def __init__(self, vehicle, period_s: float = 1.0, min_step_m: float = 2.0):
+        super().__init__(daemon=True)
+        import mav
+        self._mav = mav
+        self.vehicle = vehicle
+        self.period = period_s
+        self.min_step = min_step_m
+        self.trail: list[tuple[float, float, float]] = []   # (north, east, down)
+        self._stop = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                p = self._mav.get_local_position(self.vehicle)
+            except RuntimeError:
+                self._stop.wait(self.period); continue
+            pt = (p["north"], p["east"], p["down"])
+            if (not self.trail or
+                    math.hypot(pt[0] - self.trail[-1][0], pt[1] - self.trail[-1][1]) >= self.min_step):
+                self.trail.append(pt)
+            self._stop.wait(self.period)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def return_home_and_land(vehicle, trail: list[tuple[float, float, float]],
+                         cfg: dict, transit_alt: float | None = None) -> None:
+    """Retrace the recorded breadcrumb *trail* in reverse back to the EKF origin
+    (the arming point), then LAND there.
+
+    We retrace the outbound path instead of cutting straight home because every
+    leg of it was already flown clear of walls — a direct line back could cross
+    obstacles the explorer carefully routed around. The horizontal path is
+    replayed at a single safe *transit_alt* (default: the configured scan
+    altitude) so the return leg holds a consistent clearance height; the final
+    descent is left to LAND once we are over origin."""
+    import mav
+
+    flight_cfg = cfg.get("flight", {})
+    speed      = flight_cfg.get("speed", 5.0)
+    if transit_alt is None:
+        transit_alt = flight_cfg.get("altitude", 5.0)
+    transit_down = -abs(transit_alt)
+    accept_rad = 2.5
+    wp_timeout = 25
+
+    if not trail:
+        log.warning("Return home — no breadcrumb trail recorded, going straight to origin")
+
+    # Lift to the transit altitude before moving horizontally (we are likely low
+    # from the orbit), then thread back through the breadcrumbs and finish at origin.
+    climb_to(vehicle, transit_alt, target_found=None)
+
+    # Retrace the breadcrumbs (loose radius — these are just transit corridors).
+    waypoints = [(n, e) for (n, e, _d) in reversed(trail)]
+    log.info("Returning home — retracing %d breadcrumbs to origin at %.1f m, then LAND",
+             len(waypoints), transit_alt)
+    for i, (n, e) in enumerate(waypoints):
+        mav.goto_ned(vehicle, n, e, transit_down, speed=speed)
+        try:
+            mav.wait_ned_reached(vehicle, n, e, radius=accept_rad, timeout=wp_timeout)
+        except RuntimeError as exc:
+            log.warning("Return — breadcrumb %d/%d (N=%.1f E=%.1f) not reached: %s — continuing",
+                        i + 1, len(waypoints), n, e, exc)
+
+    # Final leg: settle precisely over the EKF origin (the launch point) with a
+    # tight radius so the LAND happens AT the start location, not metres off it.
+    home_rad = 0.5
+    log.info("Closing on origin (0,0) for a precise landing at the start point")
+    mav.goto_ned(vehicle, 0.0, 0.0, transit_down, speed=speed)
+    try:
+        mav.wait_ned_reached(vehicle, 0.0, 0.0, radius=home_rad, timeout=wp_timeout)
+    except RuntimeError as exc:
+        log.warning("Return — origin not reached within %.1f m: %s — landing anyway", home_rad, exc)
+    time.sleep(2.0)   # let position settle so we descend straight down on the start
+
+    log.info("Over origin — switching to LAND")
+    try:
+        mav.set_mode(vehicle, "LAND")
+    except Exception as exc:
+        log.warning("LAND mode set failed: %s", exc)
