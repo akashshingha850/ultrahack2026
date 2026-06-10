@@ -25,7 +25,7 @@ flight:
   # The target is expected roughly this far straight ahead of the start point —
   # dash that far forward (detection live, abort on sight, LiDAR wall-safe)
   # BEFORE the scan/spin failsafes and dynamic waypoint planning. 0 = disabled.
-  forward_dash_m:          15.0
+  forward_dash_m:          10.0
 
 coverage:
   # Radius = FENCE_RADIUS − FENCE_MARGIN (both read from the vehicle).

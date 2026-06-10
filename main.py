@@ -185,8 +185,8 @@ def main() -> None:
         log.info("Mission complete — RTL")
         _safe_mode(vehicle, "RTL")
     else:
-        log.warning("Mission ended without reaching the target — BRAKE")
-        _safe_mode(vehicle, "BRAKE")
+        log.warning("Mission ended without reaching the target — RTL")
+        _safe_mode(vehicle, "RTL")
 
     # ── Stop recording AFTER the vehicle disarms ──────────────────────────────
     # RTL lands and disarms on its own; on the BRAKE fallback the pilot lands and

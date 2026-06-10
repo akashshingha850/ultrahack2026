@@ -22,6 +22,13 @@ log = logging.getLogger(__name__)
 _MSG_OBSTACLE_DISTANCE = 330
 _MSG_DISTANCE_SENSOR   = 132
 
+# Only the 8 horizontal proximity sectors are MAV_SENSOR_ROTATION 0..7
+# (NONE/forward, YAW_45 … YAW_315). The FC also emits DISTANCE_SENSOR for other
+# orientations (e.g. a downward rangefinder), and (orientation*45)%360 folds
+# those onto a horizontal bearing — e.g. orientation 25 → 45° — injecting a
+# phantom close obstacle. Ignore anything outside 0..7.
+_HORIZONTAL_ORIENTATIONS = frozenset(range(8))
+
 
 class LidarReader:
     def __init__(self, vehicle: mavutil.mavfile) -> None:
@@ -75,10 +82,16 @@ class LidarReader:
                 self._obstacle_event.set()
             else:
                 # DISTANCE_SENSOR — SITL sends 8 of these (one per 45°
-                # orientation). Keep the latest of every orientation so a
-                # full 360° profile can be synthesised from all beams.
+                # orientation). Keep the latest of every HORIZONTAL orientation
+                # so a full 360° profile can be synthesised from all beams; drop
+                # non-horizontal sensors (e.g. a downward rangefinder) that would
+                # otherwise alias onto a bearing and read as a phantom obstacle.
+                orient = int(msg.orientation)
+                if orient not in _HORIZONTAL_ORIENTATIONS:
+                    log.debug("Ignoring DISTANCE_SENSOR orientation=%d (non-horizontal)", orient)
+                    return
                 self._latest_distance = msg
-                self._distance_by_orient[int(msg.orientation)] = msg
+                self._distance_by_orient[orient] = msg
                 if self._latest_obstacle is None:
                     # No full OBSTACLE_DISTANCE plugin — drive callers from
                     # the per-orientation DISTANCE_SENSOR set instead.
