@@ -498,6 +498,7 @@ def approach_target(vehicle, lidar, target_found: threading.Event, cfg: dict,
     stop_frac   = ap.get("stop_bbox_frac", 0.15)    # halt when the bbox fills this fraction of frame
     lidar_stop  = ap.get("lidar_stop_m", 4.0)       # also halt when a detection coincides with this LiDAR range ahead
     creep_speed = ap.get("speed_mps", 1.0)          # gentle forward speed
+    min_creep   = ap.get("min_creep_frac", 0.4)     # always creep ≥ this fraction of speed while in view
     kp_yaw      = ap.get("yaw_gain", 1.2)           # err_x → yaw rate gain
     max_yaw     = math.radians(ap.get("max_yaw_deg_s", 45.0))
     center_tol  = ap.get("center_tol", 0.08)        # |err_x| below this = "centred"
@@ -528,6 +529,7 @@ def approach_target(vehicle, lidar, target_found: threading.Event, cfg: dict,
     alt_max    = flight_cfg.get("max_search_altitude_m", 11.0)
     ret_to     = ap.get("reacquire_return_timeout_s", 20.0)   # time to re-acquire at the old vantage
     max_recov  = ap.get("reacquire_attempts", 2)              # return-to-vantage tries before relocating
+    creep_max  = ap.get("reacquire_creep_max_m", 6.0)         # creep this far forward toward the lost target
 
     def _fwd_clear():
         """Forward (body 0°) LiDAR clearance in metres; inf if no reading."""
@@ -538,35 +540,45 @@ def approach_target(vehicle, lidar, target_found: threading.Event, cfg: dict,
 
     def _return_and_reacquire(pose) -> bool:
         """Recovery on a lost target: fly BACK to the last vantage where the smoke
-        was seen, holding that yaw (gimbal fixed), and trim altitude by the bbox
-        vertical position — target low in frame ⇒ descend, high ⇒ ascend — to
-        re-frame it. Returns True once the detection is back and stable, False if
-        it stays lost. This keeps us at a known-good viewpoint instead of roaming
-        blindly away from it."""
+        was seen (holding that yaw, gimbal fixed), then creep GENTLY forward along
+        that heading toward where the smoke was — up to creep_max — to re-acquire,
+        trimming altitude by the bbox vertical position to re-frame it. No ascend
+        beyond that small altitude trim. Returns True once the detection is back
+        and stable, False if it stays lost. This keeps us at / near the last known
+        location instead of roaming blindly away from it."""
         n, e, hold_down, yaw = pose
         log.info("Approach — lost; returning to last-good vantage N=%.1f E=%.1f alt=%.1f m "
-                 "yaw=%.0f° to re-acquire", n, e, -hold_down, math.degrees(yaw) % 360)
+                 "yaw=%.0f°, then creeping gently toward the target to re-acquire",
+                 n, e, -hold_down, math.degrees(yaw) % 360)
         rdeadline = time.time() + ret_to
         seen = 0
+        crept  = 0.0                 # how far we've crept forward along yaw (m)
+        t_prev = time.time()
         while time.time() < rdeadline:
-            if target_found.is_set():
-                tgt = detection.get_latest_target(max_age=max_age)
-            else:
-                tgt = None
+            now = time.time()
+            tgt = detection.get_latest_target(max_age=max_age) if target_found.is_set() else None
             if tgt is not None:
                 seen += 1
                 err_y = tgt.get("err_y", 0.0)
-                if abs(err_y) > center_tol_y:        # ascend/descend to confirm a better view
+                if abs(err_y) > center_tol_y:        # climb/descend a touch to re-frame
                     vz = max(-max_vz, min(max_vz, kp_vz * err_y))
                     hold_down = -min(alt_max, max(alt_min, -(hold_down + vz * 0.2)))
                 if seen >= 2:                         # detection is back and stable
-                    log.info("Approach — re-acquired at the vantage (err_y=%+.2f) — resuming", err_y)
+                    log.info("Approach — re-acquired (err_y=%+.2f, crept %.1f m) — resuming approach",
+                             err_y, crept)
                     return True
             else:
                 seen = 0
-            mav.goto_ned(vehicle, n, e, hold_down, speed=creep_speed, yaw_rad=yaw)
+                # Nothing in view yet → keep creeping gently forward toward where
+                # the smoke was last seen, up to creep_max (then just hold).
+                crept = min(creep_max, crept + creep_speed * (now - t_prev))
+            t_prev = now
+            cn = n + crept * math.cos(yaw)
+            ce = e + crept * math.sin(yaw)
+            mav.goto_ned(vehicle, cn, ce, hold_down, speed=creep_speed, yaw_rad=yaw)
             time.sleep(0.2)
-        log.warning("Approach — could not re-acquire at the vantage within %.0f s", ret_to)
+        log.warning("Approach — could not re-acquire within %.0f s (crept %.1f m forward)",
+                    ret_to, crept)
         return False
 
     deadline  = time.time() + time_budget
@@ -618,8 +630,14 @@ def approach_target(vehicle, lidar, target_found: threading.Event, cfg: dict,
         yaw_rate = max(-max_yaw, min(max_yaw, kp_yaw * err_x))     # yaw onto the target
         vz = 0.0 if abs(err_y) <= center_tol_y else \
              max(-max_vz, min(max_vz, kp_vz * err_y))              # +down when target is low in frame
-        # Creep forward, but throttle down while off-centre so the nose lines up first.
-        vx = creep_speed if abs(err_x) <= center_tol else creep_speed * max(0.0, 1.0 - abs(err_x) / 0.5)
+        # Always creep FORWARD while the target is in view — the body setpoint
+        # yaws and translates at once, so there's no need to stop and pivot. Scale
+        # speed down when off-centre, but never to zero: a far/noisy target makes
+        # err_x jump around ±0.6–0.9, and the old hard cutoff (vx=0 for |err_x|≥0.5)
+        # stalled the approach so the bbox never grew and the target was lost
+        # (logs/2026-06-10_12-14-59.log). Floor at min_creep so it keeps closing in.
+        align = max(0.0, 1.0 - abs(err_x))                         # 1 centred → 0 at frame edge
+        vx = creep_speed if abs(err_x) <= center_tol else creep_speed * max(min_creep, align)
 
         mav.move_body_velocity_yaw(vehicle, vx, 0.0, yaw_rate, vz=vz)
         log.debug("Approach  err_x=%+.2f err_y=%+.2f  bbox=%.0f%%/%.0f%%  yaw=%.1f°/s  "
@@ -731,20 +749,37 @@ def orbital_scan(vehicle, lidar, target_found: threading.Event, cfg: dict) -> bo
     # Start at the bearing from centre back to the drone so we sweep from where
     # we already are.
     start_ang = math.atan2(pos["east"] - center_e, pos["north"] - center_n)
-    n_steps = max(1, int(round(360.0 * revolutions / step_deg)))
+    n_steps  = max(1, int(round(360.0 * revolutions / step_deg)))
+    step_rad = math.radians(step_deg)
 
-    for i in range(n_steps + 1):
-        ang  = start_ang + direction * math.radians(step_deg * i)
-        wp_n = center_n + radius * math.cos(ang)
-        wp_e = center_e + radius * math.sin(ang)
+    # Walk the ring one step at a time. If the LiDAR shows the side we're about to
+    # orbit INTO is blocked, reverse the orbit direction and go round the other
+    # way instead of pressing into the obstacle. Two reversals in a row means
+    # we're wedged between obstacles on both sides → stop. `guard` bounds the loop
+    # so ping-ponging across an open arc still terminates.
+    ang             = start_ang
+    done            = 0      # viewpoints actually flown
+    reversal_streak = 0      # consecutive blocked-then-reversed without progress
+    guard           = 0
+    while done < n_steps and guard < 4 * n_steps:
+        guard += 1
+        next_ang = ang + direction * step_rad
+        wp_n = center_n + radius * math.cos(next_ang)
+        wp_e = center_e + radius * math.sin(next_ang)
 
-        # Safety: don't fly a leg the LiDAR shows blocked — skip it and keep
-        # circling so we cover the accessible sides without risking a collision.
         clear = _clear_toward(wp_n, wp_e)
         if clear <= safe_clear:
-            log.warning("Orbital scan — leg to %.0f° blocked (LiDAR %.1f m ≤ %.1f m), skipping for safety",
-                        math.degrees(ang) % 360, clear, safe_clear)
+            reversal_streak += 1
+            if reversal_streak >= 2:
+                log.warning("Orbital scan — both orbit directions blocked (LiDAR %.1f m ≤ %.1f m) "
+                            "— stopping after %d viewpoints", clear, safe_clear, done)
+                break
+            direction = -direction
+            log.warning("Orbital scan — obstacle toward %.0f° (LiDAR %.1f m ≤ %.1f m) — "
+                        "reversing orbit to %s", math.degrees(next_ang) % 360, clear, safe_clear,
+                        "CW" if direction > 0 else "CCW")
             continue
+        reversal_streak = 0
 
         # Point the nose inward at the block so the camera always frames it.
         face_yaw = math.atan2(center_e - wp_e, center_n - wp_n)
@@ -752,11 +787,13 @@ def orbital_scan(vehicle, lidar, target_found: threading.Event, cfg: dict) -> bo
         try:
             mav.wait_ned_reached(vehicle, wp_n, wp_e, radius=accept_rad, timeout=wp_timeout)
         except RuntimeError as exc:
-            log.warning("Orbital scan — waypoint %d/%d not reached: %s", i, n_steps, exc)
+            log.warning("Orbital scan — waypoint not reached: %s", exc)
         if settle_s > 0:
             time.sleep(settle_s)
-        log.info("Orbital scan — at %.0f° of orbit (waypoint %d/%d)",
-                 math.degrees(ang) % 360, i, n_steps)
+        ang = next_ang
+        done += 1
+        log.info("Orbital scan — at %.0f° of orbit (%d/%d viewpoints)",
+                 math.degrees(ang) % 360, done, n_steps)
 
-    log.info("Orbital scan complete — %d viewpoints around the block", n_steps + 1)
+    log.info("Orbital scan complete — %d viewpoints around the block", done)
     return True

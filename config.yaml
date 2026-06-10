@@ -17,14 +17,15 @@ flight:
   speed: 3.0                # m/s groundspeed during coverage
   takeoff_altitude: 5.0    # metres AGL to climb before starting
   rtl_altitude: 5.0        # metres AGL for RTL
-  # When the approach loses the target and relocates, roam this much higher on
-  # each retry (capped) for a better view — addresses "not high enough to see it".
-  search_climb_step_m:     2.0    # extra altitude added per relocate attempt (m)
-  max_search_altitude_m:   11.0   # cap on the relocate search altitude (m AGL)
+  # No ascend during search/relocate — the optical-flow EKF holds this altitude
+  # fine and the target sits near launch height, so climbing only loses sight of
+  # it. max_search_altitude_m is kept only as a ceiling on the small bbox-driven
+  # altitude trim the approach uses to re-frame the target.
+  max_search_altitude_m:   11.0   # ceiling for the approach's altitude re-framing (m AGL)
   # The target is expected roughly this far straight ahead of the start point —
   # dash that far forward (detection live, abort on sight, LiDAR wall-safe)
   # BEFORE the scan/spin failsafes and dynamic waypoint planning. 0 = disabled.
-  forward_dash_m:          20.0
+  forward_dash_m:          15.0
 
 coverage:
   # Radius = FENCE_RADIUS − FENCE_MARGIN (both read from the vehicle).
@@ -107,6 +108,10 @@ approach:
   stop_bbox_frac:   0.15       # stop when bbox area ≥ this fraction of the frame
   lidar_stop_m:     4.0        # also stop when a detection coincides with a LiDAR obstacle this close ahead (m)
   speed_mps:        1.0        # gentle forward creep speed (m/s)
+  # Keep creeping forward even when off-centre (the setpoint yaws + translates at
+  # once). Speed scales down toward the frame edge but never below this fraction,
+  # so a far/noisy target (jumpy err_x) still gets closer instead of stalling.
+  min_creep_frac:   0.4        # always creep ≥ this × speed_mps while the target is in view
   # Horizontal alignment: yaw the nose onto the target.
   yaw_gain:         1.2        # err_x ∈ [-1,1] → yaw rate gain
   max_yaw_deg_s:    45.0       # clamp on yaw slew rate (deg/s)
@@ -121,10 +126,12 @@ approach:
   reacquire_yaw_deg_s: 45.0    # slew rate when re-aiming to the target bearing (deg/s)
   reacquire_timeout_s: 8.0     # how long to wait for re-detection after re-aiming (s)
   # Lost-target recovery: fly BACK to the last vantage where the smoke was seen
-  # (fixed yaw) and trim altitude by the bbox vertical position to re-frame it,
-  # instead of roaming away. Retries a few times before handing back to relocate.
-  reacquire_return_timeout_s: 20.0   # time to re-acquire at the old vantage (s)
-  reacquire_attempts:         2      # return-to-vantage recoveries before relocating
+  # (fixed yaw), then creep GENTLY forward along that heading toward the target —
+  # up to reacquire_creep_max_m — trimming altitude to re-frame it, instead of
+  # roaming away. Retries a few times before handing back to relocate.
+  reacquire_return_timeout_s: 20.0   # time to re-acquire while returning + creeping (s)
+  reacquire_attempts:         2      # return-and-creep recoveries before relocating
+  reacquire_creep_max_m:      6.0    # creep at most this far forward toward the lost target (m)
   # Flaky detection: smoke is far/low-confidence so YOLO flickers. Treat a
   # detection up to detection_max_age_s old as valid; hover through dropouts up
   # to lost_grace_s, then hand back so the mission relocates to new waypoints.

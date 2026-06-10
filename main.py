@@ -10,11 +10,17 @@ MISSION: ULTRAHACK 2026  (indoor, optical-flow EKF — no GPS / no compass)
 3. Detection first: if the primary (smoke) is already in view, go straight to the
    approach. Otherwise dash ~20 m straight ahead (the target is expected about
    that far in front of the start) — detection runs the whole way and aborts the
-   dash to the approach. Only if the dash finds nothing: ascend, then spin 360°
-   — both FAILSAFES, aborted the moment anything is detected.
-4. Reactively roam open space (open_path_explore) until the primary is found.
-5. Visual-servo approach until the front LiDAR reads ~3 m, then stop.
-6. Orbit the block ONLY if a secondary target (human/fire) is still missing.
+   dash to the approach. Only if the dash finds nothing: spin 360° in place (a
+   FAILSAFE, aborted the moment anything is detected). NO ascend at any stage —
+   the optical-flow EKF holds the scan altitude and the target sits near launch
+   height, so climbing only loses sight of it.
+4. Reactively roam open space (open_path_explore), at the fixed scan altitude,
+   until the primary is found.
+5. Visual-servo approach until the front LiDAR reads ~3 m, then stop. If the
+   smoke is lost, fly back to the last vantage and creep gently toward it to
+   re-acquire before falling back to the open-path roam.
+6. Orbit the block ONLY if a secondary target (human/fire) is still missing —
+   reversing the orbit direction if an obstacle blocks the side it's circling.
 7. RTL.
 """
 
@@ -29,7 +35,7 @@ import siyi
 import lidar as lidar_module
 import proximity_check
 from utils import (
-    setup_logging, wait_for_guided, climb_to, dash_forward, collect_spin_profile,
+    setup_logging, wait_for_guided, dash_forward, collect_spin_profile,
     open_path_explore, approach_target, orbital_scan,
 )
 
@@ -101,40 +107,35 @@ def main() -> None:
 
     flight_cfg  = cfg.get("flight", {})
     scan_alt    = flight_cfg.get("altitude", 5.0)
-    alt_step    = flight_cfg.get("search_climb_step_m", 2.0)
-    max_alt     = flight_cfg.get("max_search_altitude_m", scan_alt + 6.0)
     max_retries = cfg.get("approach", {}).get("relocate_retries", 4)
     lidar_cfg   = cfg.get("lidar", {})
 
-    # ── Detection-first; dash forward, then ascend + spin as FAILSAFES ────────
+    # ── Detection-first; dash forward, then a 360° spin as a FAILSAFE ──────────
     # There is a good chance the target is already visible on GUIDED entry — in
     # that case we skip straight to the approach. Otherwise the target is
     # expected ~20 m straight ahead of the start, so dash that far forward
     # first (detection live the whole way, aborting to the approach on sight)
-    # before any scanning or dynamic waypoint planning. Only when the dash
-    # finds nothing do we climb for a better vantage and then spin to look
-    # around; both abort the instant something is detected.
+    # before any scanning or dynamic waypoint planning. Only when the dash finds
+    # nothing do we spin in place to look around — NO ascend: the optical-flow
+    # EKF holds the scan altitude fine and the target sits near launch height, so
+    # climbing only loses sight of it. The spin aborts the instant anything shows.
     dash_m = flight_cfg.get("forward_dash_m", 0.0)
     target_bearing = None
     if target_found.is_set():
-        log.info("Primary already in view on GUIDED entry — skipping dash/ascend/spin, going to approach")
+        log.info("Primary already in view on GUIDED entry — skipping dash/spin, going to approach")
     elif dash_m > 0 and dash_forward(vehicle, lidar, target_found, cfg, distance=dash_m):
-        log.info("Primary found during the forward dash — skipping ascend/spin, going to approach")
+        log.info("Primary found during the forward dash — skipping spin, going to approach")
     else:
-        climb_to(vehicle, scan_alt, target_found=target_found)   # failsafe ascend
-        if target_found.is_set():
-            log.info("Detected during ascend — skipping the spin, going to approach")
-        else:
-            spin_dur   = lidar_cfg.get("spin_duration_s", 20.0)
-            spin_speed = lidar_cfg.get("spin_speed_deg_s", 20.0)
-            spin_max   = lidar_cfg.get("spin_max_duration_s", 45.0)
-            log.info("Failsafe 360° spin (%.0f °/s) — full turn unless the target is seen first "
-                     "(safety cap %.0f s)", spin_speed, spin_max)
-            mav.rotate_right(vehicle, 360, speed_deg_s=spin_speed)
-            hfov = cfg.get("camera", {}).get("hfov_deg", 82.6)
-            _room_profile, target_bearing = collect_spin_profile(
-                vehicle, lidar, spin_duration=spin_dur, target_found=target_found,
-                spin_speed=spin_speed, max_duration=spin_max, camera_hfov_deg=hfov)
+        spin_dur   = lidar_cfg.get("spin_duration_s", 20.0)
+        spin_speed = lidar_cfg.get("spin_speed_deg_s", 20.0)
+        spin_max   = lidar_cfg.get("spin_max_duration_s", 45.0)
+        log.info("Failsafe 360° spin (%.0f °/s) — full turn unless the target is seen first "
+                 "(safety cap %.0f s)", spin_speed, spin_max)
+        mav.rotate_right(vehicle, 360, speed_deg_s=spin_speed)
+        hfov = cfg.get("camera", {}).get("hfov_deg", 82.6)
+        _room_profile, target_bearing = collect_spin_profile(
+            vehicle, lidar, spin_duration=spin_dur, target_found=target_found,
+            spin_speed=spin_speed, max_duration=spin_max, camera_hfov_deg=hfov)
 
     # ── Search → approach → relocate loop ─────────────────────────────────────
     reached = False
@@ -143,13 +144,16 @@ def main() -> None:
     try:
         while True:
             if not target_found.is_set():
-                search_alt = min(scan_alt + attempt * alt_step, max_alt)
+                # No ascend — relocate at the fixed scan altitude every retry
+                # (optical-flow EKF, target near launch height). The approach's
+                # own recovery already creeps back toward where it last saw the
+                # smoke; this open-path roam is the wider backup if that fails.
                 if attempt == 0:
                     log.info("Coverage search — roaming open space to find the target")
                 else:
                     log.info("Relocating to re-find the target — explore at %.1f m (attempt %d/%d)",
-                             search_alt, attempt, max_retries)
-                open_path_explore(vehicle, lidar, target_found, cfg, altitude=search_alt)
+                             scan_alt, attempt, max_retries)
+                open_path_explore(vehicle, lidar, target_found, cfg, altitude=scan_alt)
                 bearing = None
 
             if not target_found.is_set():
