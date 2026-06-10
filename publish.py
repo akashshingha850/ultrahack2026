@@ -31,8 +31,18 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def open_ffmpeg(out_url: str, width: int, height: int, fps: float) -> subprocess.Popen:
-    """Spawn ffmpeg reading raw BGR frames on stdin, publishing H.264 over RTSP."""
+def open_ffmpeg(out_url: str, width: int, height: int, fps: float,
+                record_path: str | None = None) -> subprocess.Popen:
+    """Spawn ffmpeg reading raw BGR frames on stdin, publishing H.264 over RTSP.
+
+    If *record_path* is given, the same encoded stream is ALSO written to that
+    mp4 file. It is written as *fragmented* mp4 (frag_keyframe+empty_moov) so it
+    stays playable even if the process is killed mid-mission — a plain mp4 would
+    need its moov atom written on a clean exit and be unplayable otherwise. The
+    frame is encoded once and the `tee` muxer fans it out to both the RTSP publish
+    and the file; `onfail=ignore` on the RTSP leg keeps the recording going
+    through a momentary streaming hiccup.
+    """
     fps = fps if fps and fps > 0 else 25.0
     cmd = [
         "ffmpeg",
@@ -55,10 +65,23 @@ def open_ffmpeg(out_url: str, width: int, height: int, fps: float) -> subprocess
         "-pix_fmt", "yuv420p",
         "-bf", "0",
         "-g", f"{int(max(fps, 1))}",
-        "-f", "rtsp",
-        "-rtsp_transport", "tcp",
-        out_url,
     ]
-    log.info("Starting ffmpeg publisher → %s (%dx%d @ %.1f fps)",
-             out_url, width, height, fps)
+    if record_path:
+        # `tee` does not auto-trigger codec extradata, so the mp4 slave fails its
+        # header write ("Invalid data ... incorrect codec parameters") unless we
+        # force the encoder to emit a global header. RTP/RTSP needs it too, so it
+        # is safe for both slaves.
+        cmd += [
+            "-flags", "+global_header",
+            "-map", "0:v",
+            "-f", "tee",
+            f"[f=rtsp:onfail=ignore:rtsp_transport=tcp]{out_url}"
+            f"|[f=mp4:movflags=+frag_keyframe+empty_moov+default_base_moof]{record_path}",
+        ]
+        log.info("Starting ffmpeg publisher → %s + recording → %s (%dx%d @ %.1f fps)",
+                 out_url, record_path, width, height, fps)
+    else:
+        cmd += ["-f", "rtsp", "-rtsp_transport", "tcp", out_url]
+        log.info("Starting ffmpeg publisher → %s (%dx%d @ %.1f fps)",
+                 out_url, width, height, fps)
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)

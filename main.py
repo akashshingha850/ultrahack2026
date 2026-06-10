@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 
 """
-MISSION: ULTRAHACK 2026
+MISSION: ULTRAHACK 2026  (indoor, optical-flow EKF — no GPS / no compass)
 
-1. Wait for GUIDED mode.
-2. Spin 360° to build a room-frame LiDAR profile (initial localisation).
-3. Start YOLO person-detection in a background thread.
-4. Survey a grid of waypoints sized to the arena; spin 360° at each stop so
-   the camera (10-12 m detection range) sweeps the area between visits.
-5. RTL on person found or survey exhausted.
+1. Record from the start: SIYI onboard recording + the YOLO detection/annotated
+   MediaMTX stream (also saved to recordings/).
+2. Pilot takes off manually in LOITER; selecting GUIDED starts the mission.
+3. Detection first: if the primary (smoke) is already in view, go straight to the
+   approach. Otherwise ascend, then spin 360° — both FAILSAFES, aborted the moment
+   anything is detected.
+4. Reactively roam open space (open_path_explore) until the primary is found.
+5. Visual-servo approach until the front LiDAR reads ~3 m, then stop.
+6. Orbit the block ONLY if a secondary target (human/fire) is still missing.
+7. RTL.
 """
 
 import logging
@@ -18,11 +22,11 @@ import yaml
 
 import mav
 import detection
+import siyi
 import lidar as lidar_module
 from utils import (
     setup_logging, wait_for_guided, climb_to, collect_spin_profile,
     open_path_explore, approach_target, orbital_scan,
-    TrailRecorder, return_home_and_land,
 )
 
 log = logging.getLogger("main")
@@ -34,7 +38,29 @@ def main() -> None:
 
     setup_logging(cfg)
 
-    # ── Connect ───────────────────────────────────────────────────────────
+    targets   = cfg.get("targets", {})
+    primary   = targets.get("primary", "smoke")
+    secondary = targets.get("secondary", [])
+
+    # ── Recording starts immediately, before any flight ───────────────────────
+    # SIYI onboard recording (to the camera card) is independent of the YOLO feed
+    # recording; wrap it so a missing/offline camera never aborts the mission.
+    camera = None
+    try:
+        camera = siyi.connect()
+        siyi.start_recording(camera)
+    except Exception as exc:
+        log.warning("SIYI camera recording not started (%s) — continuing without it", exc)
+
+    # Detection + annotated stream (+ stream recording) — runs the whole mission.
+    # The PRIMARY drives guidance/target_found; secondaries are tracked for the
+    # orbit decision and drawn on the overlay.
+    target_found = threading.Event()
+    detection.watch_for(primary, target_found, secondary=secondary)
+    log.info("Detection+stream pipeline started (primary='%s', secondary=%s) — annotated feed → %s",
+             primary, secondary, cfg["stream"]["output"])
+
+    # ── Connect ───────────────────────────────────────────────────────────────
     conn = cfg["connection"]
     vehicle = mav.connect(
         conn["string"], baud=conn.get("baud", 57600),
@@ -43,106 +69,70 @@ def main() -> None:
     )
     log.info("Vehicle connected")
 
-    # ── Detection starts immediately — runs for the entire mission ────────
-    target_class = cfg.get("approach", {}).get("target_class", "person")
-    # The detection thread is a single pipeline: it runs YOLO once per frame to
-    # drive guidance AND re-publishes the annotated feed (frame-centre +
-    # bottom-centre-of-target markers) to MediaMTX — both live from the start.
-    # View it live (e.g. VLC → the output URL); MediaMTX must be up first:
-    #   cd mediamtx && docker compose up -d
-    target_found = threading.Event()
-    detection.watch_for(target_class, target_found)
-    log.info("Detection+stream pipeline started (target='%s') — annotated feed → %s",
-             target_class, cfg["stream"]["output"])
-
     if not mav.check_lidar_available(vehicle, timeout=3.0):
         raise RuntimeError("No LiDAR data — check PRX1_TYPE and proximity plugin")
 
+    # Pilot takes off manually in LOITER; selecting GUIDED is the "go" signal.
     wait_for_guided(vehicle)
 
-    # Record a breadcrumb trail of everywhere we fly from here on, so that once
-    # the target is scanned we can retrace the same collision-checked path back
-    # to origin and land, instead of cutting blindly across the arena.
-    trail = TrailRecorder(vehicle)
-    trail.start()
-
-    # ── Initial spin ──────────────────────────────────────────────────────
-    # A 360° at the start position: cheap insurance for a target that is
-    # beside/behind the drone at launch, and a chance to detect before we move.
-    # Completes a tracked full turn UNLESS the target is spotted partway round —
-    # then it stops and heads straight to the target (skipping the rest of the
-    # spin and the coverage search).
-    lidar_cfg = cfg.get("lidar", {})
     lidar = lidar_module.LidarReader(vehicle)
     lidar.request_streams()
     time.sleep(0.5)
 
-    # Detection has priority over altitude: climb toward the scan height only
-    # while nothing is in view. The moment YOLO sees the target — already, or
-    # partway up — we abandon the climb and go straight to approaching it.
-    scan_alt = cfg.get("flight", {}).get("altitude", 5.0)
-    climb_to(vehicle, scan_alt, target_found=target_found)
-
-    target_bearing = None
-    if target_found.is_set():
-        # Already in view (during the climb or before it) — don't bother spinning,
-        # head straight for it.
-        log.info("Target already in view — skipping the 360° spin, going to approach")
-    else:
-        spin_dur   = lidar_cfg.get("spin_duration_s", 20.0)
-        spin_speed = lidar_cfg.get("spin_speed_deg_s", 20.0)
-        spin_max   = lidar_cfg.get("spin_max_duration_s", 45.0)
-        log.info("Starting 360° spin (%.0f °/s commanded) — full turn unless the target "
-                 "is seen first (safety cap %.0f s)", spin_speed, spin_max)
-        mav.rotate_right(vehicle, 360, speed_deg_s=spin_speed)
-        hfov = cfg.get("camera", {}).get("hfov_deg", 82.6)
-        room_profile, target_bearing = collect_spin_profile(
-            vehicle, lidar, spin_duration=spin_dur, target_found=target_found,
-            spin_speed=spin_speed, max_duration=spin_max, camera_hfov_deg=hfov)
-        log.info("Spin complete — %d/360 angles with valid range data",
-                 int(sum(1 for v in room_profile if v != float("inf"))))
-
-    # ── Search → approach → relocate loop ────────────────────────────────────
-    # Reactive open-path explorer finds the target (camera detects while moving);
-    # the approach creeps in and stops when the bbox is big enough, then orbits.
-    # If the approach loses the target and a quick yaw search can't recover it,
-    # we RELOCATE — roam to new waypoints, a little higher each retry for a better
-    # view — and try again, instead of spinning fruitlessly in one spot.
     flight_cfg  = cfg.get("flight", {})
     scan_alt    = flight_cfg.get("altitude", 5.0)
     alt_step    = flight_cfg.get("search_climb_step_m", 2.0)
     max_alt     = flight_cfg.get("max_search_altitude_m", scan_alt + 6.0)
     max_retries = cfg.get("approach", {}).get("relocate_retries", 4)
+    lidar_cfg   = cfg.get("lidar", {})
 
+    # ── Detection-first; ascend + spin are FAILSAFES ──────────────────────────
+    # There is a good chance the target is already visible on GUIDED entry — in
+    # that case we skip straight to the approach. Only when nothing is in view do
+    # we climb for a better vantage and then spin to look around; both abort the
+    # instant something is detected.
+    target_bearing = None
+    if target_found.is_set():
+        log.info("Primary already in view on GUIDED entry — skipping ascend/spin, going to approach")
+    else:
+        climb_to(vehicle, scan_alt, target_found=target_found)   # failsafe ascend
+        if target_found.is_set():
+            log.info("Detected during ascend — skipping the spin, going to approach")
+        else:
+            spin_dur   = lidar_cfg.get("spin_duration_s", 20.0)
+            spin_speed = lidar_cfg.get("spin_speed_deg_s", 20.0)
+            spin_max   = lidar_cfg.get("spin_max_duration_s", 45.0)
+            log.info("Failsafe 360° spin (%.0f °/s) — full turn unless the target is seen first "
+                     "(safety cap %.0f s)", spin_speed, spin_max)
+            mav.rotate_right(vehicle, 360, speed_deg_s=spin_speed)
+            hfov = cfg.get("camera", {}).get("hfov_deg", 82.6)
+            _room_profile, target_bearing = collect_spin_profile(
+                vehicle, lidar, spin_duration=spin_dur, target_found=target_found,
+                spin_speed=spin_speed, max_duration=spin_max, camera_hfov_deg=hfov)
+
+    # ── Search → approach → relocate loop ─────────────────────────────────────
     reached = False
     bearing = target_bearing      # re-aim hint, only valid straight from the spin
     attempt = 0
     try:
         while True:
-            # Find (or re-find) the target by roaming, unless we already see it.
             if not target_found.is_set():
                 search_alt = min(scan_alt + attempt * alt_step, max_alt)
                 if attempt == 0:
-                    log.info("Coverage search — roaming to find the target")
+                    log.info("Coverage search — roaming open space to find the target")
                 else:
-                    log.info("Relocating to re-find the target — explore at %.1f m "
-                             "(attempt %d/%d)", search_alt, attempt, max_retries)
+                    log.info("Relocating to re-find the target — explore at %.1f m (attempt %d/%d)",
+                             search_alt, attempt, max_retries)
                 open_path_explore(vehicle, lidar, target_found, cfg, altitude=search_alt)
                 bearing = None
-            else:
-                log.info("Target already detected during the spin — skipping coverage search")
 
             if not target_found.is_set():
                 log.warning("Exploration exhausted — no target found")
                 break
 
-            # Creep toward the target, centring the bbox; stop when it fills the
-            # frame, then orbit. Returns False if the target was lost and a quick
-            # yaw search couldn't recover it → relocate and retry.
             reached = approach_target(vehicle, lidar, target_found, cfg,
                                       reacquire_bearing_deg=bearing)
             if reached:
-                orbital_scan(vehicle, lidar, target_found, cfg)
                 break
 
             attempt += 1
@@ -153,25 +143,36 @@ def main() -> None:
             target_found.clear()      # force a fresh re-detection from the new vantage
     finally:
         lidar.close()
-        trail.stop()
 
-    # ── Return home & land ────────────────────────────────────────────────────
+    # ── Orbit (only if a secondary is still missing) then RTL ─────────────────
     if reached:
-        log.info("Target reached and scanned — retracing the path back to origin to land")
-        try:
-            return_home_and_land(vehicle, trail.trail, cfg)
-        except Exception as exc:
-            log.warning("Return-home failed (%s) — BRAKE instead", exc)
-            try:
-                mav.set_mode(vehicle, "BRAKE")
-            except Exception as exc2:
-                log.warning("BRAKE mode set failed: %s", exc2)
+        missing = [s for s in secondary if not detection.was_seen(s)]
+        if missing:
+            log.info("Secondary target(s) %s not yet seen — orbiting the block to find them", missing)
+            orbital_scan(vehicle, lidar, target_found, cfg)
+        else:
+            log.info("All secondary targets already seen — skipping the orbital scan")
+        log.info("Mission complete — RTL")
+        _safe_mode(vehicle, "RTL")
     else:
         log.warning("Mission ended without reaching the target — BRAKE")
+        _safe_mode(vehicle, "BRAKE")
+
+    # ── Stop recording ────────────────────────────────────────────────────────
+    if camera is not None:
         try:
-            mav.set_mode(vehicle, "BRAKE")
+            siyi.stop_recording(camera)
         except Exception as exc:
-            log.warning("BRAKE mode set failed: %s", exc)
+            log.warning("SIYI stop_recording failed: %s", exc)
+        finally:
+            camera._close()
+
+
+def _safe_mode(vehicle, mode: str) -> None:
+    try:
+        mav.set_mode(vehicle, mode)
+    except Exception as exc:
+        log.warning("%s mode set failed: %s", mode, exc)
 
 
 if __name__ == "__main__":

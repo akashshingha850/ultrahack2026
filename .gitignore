@@ -39,3 +39,8 @@ Thumbs.db
 *.pt
 *.engine
 *.onnx
+
+
+# Video files
+*.mp4
+*.mkv

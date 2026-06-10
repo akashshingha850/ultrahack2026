@@ -16,6 +16,8 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime
+
 import yaml
 
 from ultralytics import YOLO
@@ -46,6 +48,22 @@ model = YOLO(_yolo_cfg["model"])
 # ---------------------------------------------------------------------------
 _latest_lock = threading.Lock()
 _latest_target: dict | None = None
+
+# When each tracked class was last seen (label -> time.time()). The mission reads
+# this via was_seen() to decide whether the secondary targets (human, fire) were
+# already found — if so it can skip the orbital scan.
+_seen_lock = threading.Lock()
+_seen: dict[str, float] = {}
+
+
+def was_seen(label: str, within: float | None = None) -> bool:
+    """True if *label* has been detected. With *within* (seconds), only counts a
+    detection that recent; without it, counts ever-seen for the whole run."""
+    with _seen_lock:
+        t = _seen.get(label)
+    if t is None:
+        return False
+    return within is None or (time.time() - t) <= within
 
 
 def get_latest_target(max_age: float = 0.5) -> dict | None:
@@ -81,21 +99,35 @@ def get_latest_target(max_age: float = 0.5) -> dict | None:
     return tgt
 
 
-def watch_for(label: str, event: threading.Event) -> threading.Thread:
-    """Start the detection+stream thread: sets *event* the moment *label* is seen.
+def watch_for(label: str, event: threading.Event,
+              secondary: "list[str] | tuple[str, ...]" = ()) -> threading.Thread:
+    """Start the detection+stream thread.
 
-    From a single YOLO inference per frame it (a) publishes the most-confident
-    target's bbox geometry via get_latest_target() for the approach loop, (b)
-    logs detections, and (c) re-publishes the annotated feed (frame-centre +
-    bottom-centre-of-target markers) to MediaMTX. Keeps retrying if the stream
-    is unavailable.
+    *label* is the PRIMARY target: the moment it is seen, *event* is set and its
+    bbox geometry is published via get_latest_target() to drive the approach.
+    *secondary* classes are also detected — drawn on the overlay and recorded via
+    was_seen() — but they do not drive guidance.
+
+    From one YOLO inference per frame it (a) publishes the best primary box for
+    the approach loop, (b) records when each tracked class was last seen, and
+    (c) re-publishes the annotated feed (all tracked classes) to MediaMTX, while
+    also saving that feed to stream.record_dir for later review. Retries if the
+    stream is unavailable.
     """
     global _latest_target
+
+    tracked = {label, *secondary}
 
     out_url = publish.publish_url(_stream_cfg["output"]) if publish.ffmpeg_available() else None
     if out_url is None:
         log.warning("ffmpeg not found on PATH — annotated stream will NOT be published "
                     "(detection/guidance still runs)")
+
+    record_path = None
+    record_dir = _stream_cfg.get("record_dir")
+    if out_url is not None and record_dir:
+        os.makedirs(record_dir, exist_ok=True)
+        record_path = os.path.join(record_dir, datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".mp4")
 
     def _run() -> None:
         global _latest_target
@@ -114,23 +146,28 @@ def watch_for(label: str, event: threading.Event) -> threading.Thread:
                     frame = result.orig_img
                     frame_h, frame_w = result.orig_shape  # (h, w)
 
-                    # Build target-class detections in guide's dict format — used
-                    # both for the overlay and to pick the best box for guidance.
+                    # Build detections for every tracked class in guide's dict
+                    # format — used for the overlay; pick the best PRIMARY box for
+                    # guidance and record when each class was last seen.
                     dets: list[dict] = []
-                    best = None  # (conf, x1, y1, x2, y2)
+                    best = None  # best primary box: (conf, x1, y1, x2, y2)
+                    now = time.time()
                     for c, conf, xyxy in zip(result.boxes.cls, result.boxes.conf,
                                              result.boxes.xyxy):
-                        if model.names[int(c)] != label:
+                        name = model.names[int(c)]
+                        if name not in tracked:
                             continue
                         x1, y1, x2, y2 = (float(v) for v in xyxy)
                         bcx = (x1 + x2) / 2.0
                         dets.append({
-                            "label": label, "conf": float(conf),
+                            "label": name, "conf": float(conf),
                             "box": (x1, y1, x2, y2),
                             "center": (bcx, (y1 + y2) / 2.0),
                             "bottom_center": (bcx, y2),
                         })
-                        if best is None or float(conf) > best[0]:
+                        with _seen_lock:
+                            _seen[name] = now
+                        if name == label and (best is None or float(conf) > best[0]):
                             best = (float(conf), x1, y1, x2, y2)
 
                     # ── Publish the annotated frame (EVERY frame → continuous) ──
@@ -139,7 +176,8 @@ def watch_for(label: str, event: threading.Event) -> threading.Thread:
                             annotated = guide.visualize(frame.copy(), dets)
                             if ffmpeg is None or ffmpeg.poll() is not None:
                                 h, w = annotated.shape[:2]
-                                ffmpeg = publish.open_ffmpeg(out_url, w, h, 0)
+                                ffmpeg = publish.open_ffmpeg(out_url, w, h, 0,
+                                                             record_path=record_path)
                             ffmpeg.stdin.write(annotated.tobytes())
                         except (BrokenPipeError, ValueError):
                             log.warning("ffmpeg pipe broke — restarting publisher")
@@ -147,7 +185,7 @@ def watch_for(label: str, event: threading.Event) -> threading.Thread:
                         except Exception as exc:
                             log.debug("Annotated-stream publish error: %s", exc)
 
-                    # ── Drive guidance from the best target box ──
+                    # ── Drive guidance from the best PRIMARY box ──
                     if best is not None:
                         conf, x1, y1, x2, y2 = best
                         log.info("Detected: %s %.2f", label, conf)

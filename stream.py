@@ -40,7 +40,7 @@ with open("config.yaml") as f:
 
 _yolo_cfg = _cfg["yolo"]
 _stream_cfg = _cfg["stream"]
-_target_class = _cfg.get("approach", {}).get("target_class", "smoke")
+_target_class = _cfg.get("targets", {}).get("primary", "smoke")
 
 
 def main() -> None:

@@ -6,9 +6,11 @@ connection:
   # UDP:    udp:127.0.0.1:14550
   # TCP:    tcp:127.0.0.1:5760
   string: "udpin:0.0.0.0:14500"
+  # string: "/dev/ttyTHS1"
   baud: 57600
+  # baud: 115200
   source_system: 255
-  timeout: 30               # seconds to wait for heartbeat
+  timeout: 60               # seconds to wait for heartbeat
 
 flight:
   altitude: 5.0            # metres AGL for survey passes
@@ -74,6 +76,15 @@ stream:
   # input:  "rtsp://192.168.144.25:8554/main.264"
   input:  "rtsp://localhost:8554/live"   # for testing with a local stream (e.g. ffmpeg)
   output: "rtsp://0.0.0.0:8555/live"
+  record_dir: "recordings"   # annotated output feed is also saved here as <timestamp>.mp4 ("" = off)
+
+# Detection targets. PRIMARY is what the mission flies to — the smoke plume marks
+# the block / fire source. SECONDARY targets are also detected and logged; if ALL
+# of them have been seen by the time we reach the block, the orbital scan is
+# skipped, otherwise we orbit to catch the ones sitting on the far side.
+targets:
+  primary:   "smoke"
+  secondary: ["human", "fire"]
 
 yolo:
   model:      "ultrahack2026.engine"   # model weights file (downloaded automatically if missing)
@@ -85,7 +96,7 @@ yolo:
 # for horizontal, climb/descend for vertical — the gimbal is never moved), and
 # stop when the bbox fills stop_bbox_frac of the frame. Vision only.
 approach:
-  target_class:     "human"   # YOLO class to detect and home in on
+  # The class the approach homes in on is the PRIMARY from the `targets` block.
   # Stop once the bbox fills this fraction of the frame (triggers the orbital
   # scan). If never reached but the target stays in view, the approach still
   # proceeds to the orbit when time_budget_s elapses. Logs "bbox=NN%" each cycle.
