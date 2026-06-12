@@ -12,14 +12,21 @@ Autonomous indoor search-and-detect drone built for the **UltraHack 2026** chall
 
 ## Results
 
-Final deliverables live in [result/](result/):
+Final deliverables live in [result/](result/) — presentation: [UltraHack Presentation.pdf](result/UltraHack%20Presentation.pdf) (system overview, detection pipeline, flight results).
 
-| File | What it shows |
-|------|---------------|
-| [UltraHack Presentation.pdf](result/UltraHack%20Presentation.pdf) | Final presentation — system overview, detection pipeline, flight results |
-| `run2.mp4` / `run2_annotated.mp4` | Competition flight (raw + YOLO-annotated onboard view) |
-| `dynamic_path_planning.mp4` | Simulation of the reactive `open_path_explore` planner |
-| `log_visual.mp4` | 3-D EKF optical-flow flight-path replay from the dataflash log |
+### Competition flight — YOLO-annotated onboard view
+
+https://github.com/akashshingha850/ultrahack2026/raw/main/result/run2_annotated.mp4
+
+Raw (unannotated) footage of the same flight: [run2.mp4](result/run2.mp4)
+
+### Reactive exploration planner (`open_path_explore`) — simulation
+
+https://github.com/akashshingha850/ultrahack2026/raw/main/result/dynamic_path_planning.mp4
+
+### 3-D EKF optical-flow flight-path replay from the dataflash log
+
+https://github.com/akashshingha850/ultrahack2026/raw/main/result/log_visual.mp4
 
 ### What worked
 
