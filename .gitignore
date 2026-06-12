@@ -32,7 +32,7 @@ Thumbs.db
 
 # MAVLink / ArduPilot artefacts
 *.tlog
-*.bin
+# *.bin
 *.param
 
 #YOLO
@@ -41,6 +41,9 @@ Thumbs.db
 *.onnx
 
 
-# Video files
-*.mp4
-*.mkv
+# # Video files
+# *.mp4
+# *.mkv
+
+# Recordings
+/recordings/
